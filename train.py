@@ -30,7 +30,7 @@ from torch.nn.parallel import DistributedDataParallel as NativeDDP
 
 from timm.data import create_dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
 from timm.models import create_model, safe_model_name, resume_checkpoint, load_checkpoint, model_parameters
-from timm.layers import convert_splitbn_model
+from timm.models.layers import convert_splitbn_model
 from timm.utils import *
 from timm.loss import *
 from timm.optim import create_optimizer_v2, optimizer_kwargs
@@ -350,6 +350,8 @@ def main():
     args.device = 'cuda:0'
     args.world_size = 1
     args.rank = 0  # global rank
+    if 'LOCAL_RANK' in os.environ:
+        args.local_rank = int(os.environ['LOCAL_RANK'])
     if args.distributed:
         args.device = 'cuda:%d' % args.local_rank
         torch.cuda.set_device(args.local_rank)
@@ -502,6 +504,7 @@ def main():
     if args.local_rank == 0:
         _logger.info('Github ID: {}'.format(get_git_commit_id()))
         _logger.info('Scheduled epochs: {}'.format(num_epochs))
+    print(f"class_map: {args.class_map}")
 
     # create the train and eval datasets
     dataset_train = create_dataset(
@@ -510,12 +513,18 @@ def main():
         download=args.dataset_download,
         batch_size=args.batch_size,
         repeats=args.epoch_repeats)
+
+
+
+
     dataset_eval = create_dataset(
         args.dataset, root=args.data_dir, split=args.val_split, is_training=False,
         class_map=args.class_map,
         download=args.dataset_download,
         batch_size=args.batch_size)
-
+    print(f"Dataset type: {type(dataset_eval)}")
+    print(f"Number of samples: {len(dataset_eval)}")
+    print(f"Sample {1}: Path = {dataset_eval[0]}, Label = {dataset_eval[200]}")
     # setup mixup / cutmix
     collate_fn = None
     mixup_fn = None
@@ -539,6 +548,9 @@ def main():
     train_interpolation = args.train_interpolation
     if args.no_aug or not train_interpolation:
         train_interpolation = data_config['interpolation']
+
+
+
     loader_train = create_loader(
         dataset_train,
         input_size=data_config['input_size'],
@@ -703,8 +715,8 @@ def train_one_epoch(
             input = input.contiguous(memory_format=torch.channels_last)
 
         with amp_autocast():
-            output = model(input)
-            loss = loss_fn(output, target)
+            output, losses = model(input)
+            loss = loss_fn(output, target) + losses['L_Clst'] + losses['L_Sep'] + losses['L_Orth'] + losses['L_Entropy']
 
         if not args.distributed:
             losses_m.update(loss.item(), input.size(0))
@@ -799,7 +811,7 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                 input = input.contiguous(memory_format=torch.channels_last)
 
             with amp_autocast():
-                output = model(input)
+                output, losses = model(input)
             if isinstance(output, (tuple, list)):
                 output = output[0]
 
@@ -809,7 +821,7 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                 output = output.unfold(0, reduce_factor, reduce_factor).mean(dim=2)
                 target = target[0:target.size(0):reduce_factor]
 
-            loss = loss_fn(output, target)
+            loss = loss_fn(output, target) + losses['L_Clst'] + losses['L_Sep'] + losses['L_Orth'] + losses['L_Entropy']
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
             if args.distributed:

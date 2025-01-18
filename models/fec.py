@@ -4,11 +4,11 @@ import os
 import copy
 import torch
 import torch.nn as nn
-
+from compute_constraint_loss import orthogonality_loss
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.layers import DropPath, trunc_normal_
 from timm.models.registry import register_model
-from timm.layers.helpers import to_2tuple
+from timm.models.layers.helpers import to_2tuple
 from einops import rearrange
 import torch.nn.functional as F
 from torch_scatter import scatter_sum
@@ -197,6 +197,7 @@ class Cluster(nn.Module):
         b, c, w, h = x.shape
         centers = self.centers_proposal(x)  # [b,c,C_W,C_H], we set M = C_W*C_H and N = w*h
         value_centers = rearrange(self.centers_proposal(value), 'b c w h -> b (w h) c')  # [b,C_W,C_H,c]
+
         b, c, ww, hh = centers.shape
         sim = torch.sigmoid(
             self.sim_beta +
@@ -205,10 +206,31 @@ class Cluster(nn.Module):
                 x.reshape(b, c, -1).permute(0, 2, 1)
             )
         )  # [B,M,N]
+
         # we use mask to sololy assign each point to one center
         sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
+
+        # 1. compute cluster loss
+        L_Clst = -torch.mean(sim_max)  
+
         mask = torch.zeros_like(sim)  # binary #[B,M,N]
         mask.scatter_(1, sim_max_idx, 1.)
+
+
+        # 2. compute separate loss
+        mask_neg = 1 - mask  # Mask for non-assigned centers
+        sim_neg = sim * mask_neg  # Similarities to non-assigned centers
+        # maximum similarity to non-assigned centers
+        sim_neg_max, _ = sim_neg.max(dim=1)  # [B,N]
+        L_Sep = torch.mean(sim_neg_max)
+
+        #3. compute orthogonality loss
+        L_Orth = orthogonality_loss(centers)
+
+        #4. balance regularization
+        cluster_probs = mask.sum(dim=-1) / mask.size(-1)  # [B, M]，probability of hard assignment
+        L_Entropy = -torch.mean(torch.sum(cluster_probs * torch.log(cluster_probs + 1e-6), dim=-1))
+
         sim = sim * mask
         value2 = rearrange(value, 'b c w h -> b (w h) c')  # [B,N,D]
         # aggregate step, out shape [B,M,D]
@@ -229,7 +251,7 @@ class Cluster(nn.Module):
             out = rearrange(out, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
         out = rearrange(out, "(b e) c w h -> b (e c) w h", e=self.heads)
         out = self.proj(out)
-        return out
+        return out, {"L_Clst": L_Clst, "L_Sep": L_Sep, "L_Orth": L_Orth, "L_Entropy": L_Entropy}
 
 
 class Mlp(nn.Module):
@@ -301,17 +323,18 @@ class ClusterBlock(nn.Module):
             self.layer_scale_2 = nn.Parameter(layer_scale_init_value * torch.ones((dim)), requires_grad=True)
 
     def forward(self, x):
+        out, cluster_losses = self.token_mixer(self.norm1(x))
         if self.use_layer_scale:
             x = x + self.drop_path(
                 self.layer_scale_1.unsqueeze(-1).unsqueeze(-1)
-                * self.token_mixer(self.norm1(x)))
+                * out)
             x = x + self.drop_path(
                 self.layer_scale_2.unsqueeze(-1).unsqueeze(-1)
                 * self.mlp(self.norm2(x)))
         else:
-            x = x + self.drop_path(self.token_mixer(self.norm1(x)))
+            x = x + self.drop_path(out)
             x = x + self.drop_path(self.mlp(self.norm2(x)))
-        return x
+        return x, cluster_losses
 
 
 def basic_blocks(dim, index, layers,
@@ -495,30 +518,38 @@ class FEC(nn.Module):
 
     def forward_tokens(self, x):
         outs = []
+        losses = {"L_Clst": 0, "L_Sep": 0, "L_Orth": 0, "L_Entropy": 0}
         for idx, block in enumerate(self.network):
-            x = block(x)
+            if isinstance(block, ClusterBlock):
+                x, block_losses = block(x)
+                losses["L_Clst"] += block_losses["L_Clst"]
+                losses["L_Sep"] += block_losses["L_Sep"]
+                losses["L_Orth"] += block_losses["L_Orth"]
+                losses["L_Entropy"] += block_losses["L_Entropy"]
+            elif isinstance(block, ClusterPool):
+                x = block(x)
             if self.fork_feat and idx in self.out_indices:
                 norm_layer = getattr(self, f'norm{idx}')
                 x_out = norm_layer(x)
                 outs.append(x_out)
         if self.fork_feat:
             # output the features of four stages for dense prediction
-            return outs
+            return outs, losses
         # output only the features of last layer for image classification
-        return x
+        return x, losses
 
     def forward(self, x):
         # input embedding
         x = self.forward_embeddings(x)
         # through backbone
-        x = self.forward_tokens(x)
+        x, losses = self.forward_tokens(x)
         if self.fork_feat:
             # otuput features of four stages for dense prediction
-            return x
+            return x, losses
         x = self.norm(x)
         cls_out = self.head(x.mean([-2, -1]))
         # for image classification
-        return cls_out
+        return cls_out, losses
 
 
 @register_model
