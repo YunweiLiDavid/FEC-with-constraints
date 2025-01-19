@@ -210,8 +210,7 @@ class Cluster(nn.Module):
         # we use mask to sololy assign each point to one center
         sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
 
-        # 1. compute cluster loss
-        L_Clst = -torch.mean(sim_max)  
+        
 
         mask = torch.zeros_like(sim)  # binary #[B,M,N]
         mask.scatter_(1, sim_max_idx, 1.)
