@@ -12,7 +12,7 @@ from timm.models.layers.helpers import to_2tuple
 from einops import rearrange
 import torch.nn.functional as F
 from torch_scatter import scatter_sum
-
+from mcr import MaximalCodingRateReduction
 try:
     from mmseg.models.builder import BACKBONES as seg_BACKBONES
     from mmseg.utils import get_root_logger
@@ -180,6 +180,7 @@ class Cluster(nn.Module):
         self.centers_proposal = nn.AdaptiveAvgPool2d((proposal_w, proposal_h))
         self.fold_w = fold_w
         self.fold_h = fold_h
+        self.mcr = MaximalCodingRateReduction(eps=0.01,gamma=1.0)
 
     def forward(self, x):  # [b,c,w,h]
         value = self.v(x)
@@ -216,19 +217,7 @@ class Cluster(nn.Module):
         mask.scatter_(1, sim_max_idx, 1.)
 
 
-        # 2. compute separate loss
-        mask_neg = 1 - mask  # Mask for non-assigned centers
-        sim_neg = sim * mask_neg  # Similarities to non-assigned centers
-        # maximum similarity to non-assigned centers
-        sim_neg_max, _ = sim_neg.max(dim=1)  # [B,N]
-        L_Sep = torch.mean(sim_neg_max)
 
-        #3. compute orthogonality loss
-        L_Orth = orthogonality_loss(centers)
-
-        #4. balance regularization
-        cluster_probs = mask.sum(dim=-1) / mask.size(-1)  # [B, M]，probability of hard assignment
-        L_Entropy = -torch.mean(torch.sum(cluster_probs * torch.log(cluster_probs + 1e-6), dim=-1))
 
         sim = sim * mask
         value2 = rearrange(value, 'b c w h -> b (w h) c')  # [B,N,D]
@@ -250,7 +239,9 @@ class Cluster(nn.Module):
             out = rearrange(out, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
         out = rearrange(out, "(b e) c w h -> b (e c) w h", e=self.heads)
         out = self.proj(out)
-        return out, {"L_Clst": L_Clst, "L_Sep": L_Sep, "L_Orth": L_Orth, "L_Entropy": L_Entropy}
+        #compute mcr loss of NMCE
+        mcr_loss = self.mcr(out, mask)
+        return out, mcr_loss
 
 
 class Mlp(nn.Module):
