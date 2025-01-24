@@ -216,21 +216,21 @@ class Cluster(nn.Module):
         mask = torch.zeros_like(sim)  # binary #[B,M,N]
         mask.scatter_(1, sim_max_idx, 1.)
 
-
+        
         # 2. compute separate loss
         mask_neg = 1 - mask  # Mask for non-assigned centers
         sim_neg = sim * mask_neg  # Similarities to non-assigned centers
         # maximum similarity to non-assigned centers
         sim_neg_max, _ = sim_neg.max(dim=1)  # [B,N]
         L_Sep = torch.mean(sim_neg_max)
-
+        
         #3. compute orthogonality loss
         L_Orth = orthogonality_loss(centers)
-
+        
         #4. balance regularization
         cluster_probs = mask.sum(dim=-1) / mask.size(-1)  # [B, M]，probability of hard assignment
         L_Entropy = -torch.mean(torch.sum(cluster_probs * torch.log(cluster_probs + 1e-6), dim=-1))
-
+        
         sim = sim * mask
         value2 = rearrange(value, 'b c w h -> b (w h) c')  # [B,N,D]
         # aggregate step, out shape [B,M,D]
@@ -520,12 +520,13 @@ class FEC(nn.Module):
         outs = []
         losses = {"L_Clst": 0, "L_Sep": 0, "L_Orth": 0, "L_Entropy": 0}
         for idx, block in enumerate(self.network):
-            if isinstance(block, ClusterBlock):
-                x, block_losses = block(x)
-                losses["L_Clst"] += block_losses["L_Clst"]
-                losses["L_Sep"] += block_losses["L_Sep"]
-                losses["L_Orth"] += block_losses["L_Orth"]
-                losses["L_Entropy"] += block_losses["L_Entropy"]
+            if isinstance(block, torch.nn.Sequential):
+                for sub_idx, sub_block in enumerate(block):
+                    x, block_losses = sub_block(x)
+                    losses["L_Clst"] += block_losses["L_Clst"]
+                    losses["L_Sep"] += block_losses["L_Sep"]
+                    losses["L_Orth"] += block_losses["L_Orth"]
+                    losses["L_Entropy"] += block_losses["L_Entropy"]
             elif isinstance(block, ClusterPool):
                 x = block(x)
             if self.fork_feat and idx in self.out_indices:

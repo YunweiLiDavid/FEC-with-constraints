@@ -19,8 +19,8 @@ import torch.nn.parallel
 from collections import OrderedDict
 from contextlib import suppress
 
-from timm.layers import apply_test_time_pool
-from timm.models import create_model, load_checkpoint, is_model, list_models
+
+from timm.models import apply_test_time_pool, create_model, load_checkpoint, is_model, list_models
 from timm.data import create_dataset, create_loader, resolve_data_config, RealLabelsImagenet
 from timm.utils import accuracy, AverageMeter, natural_key, setup_default_logging, set_jit_legacy
 
@@ -231,11 +231,12 @@ def validate(args):
 
             # compute output
             with amp_autocast():
-                output = model(input)
+                output, constraint_losses = model(input)
 
             if valid_labels is not None:
                 output = output[:, valid_labels]
-            loss = criterion(output, target)
+            loss = criterion(output, target) + 0.1*constraint_losses['L_Clst'] + 0.1*constraint_losses['L_Sep'] + 0.01*constraint_losses['L_Entropy'] + 0.0001*constraint_losses['L_Orth']
+
 
             if real_labels is not None:
                 real_labels.add_result(output)
