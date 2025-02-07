@@ -240,7 +240,7 @@ class Cluster(nn.Module):
         out = rearrange(out, "(b e) c w h -> b (e c) w h", e=self.heads)
         out = self.proj(out)
         #compute mcr loss of NMCE
-        mcr_loss = self.mcr(out, mask)
+        mcr_loss, _ = self.mcr(out, mask)
         return out, mcr_loss
 
 

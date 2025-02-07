@@ -16,6 +16,11 @@ class MaximalCodingRateReduction(torch.nn.Module):
         return logdet / 2.
     
     def compute_compress_loss(self, W, Pi):
+        '''
+        Pi: [B, M, N]
+        M: number of clusters
+        N: number of points
+        '''
         p, m = W.shape
         k, _, _ = Pi.shape
         I = torch.eye(p,device=W.device).expand((k,p,p))
@@ -27,8 +32,9 @@ class MaximalCodingRateReduction(torch.nn.Module):
         compress_loss = (trPi.squeeze()*log_det/(2*m)).sum()
         return compress_loss
         
-    def forward(self, X, Y, num_classes=None):
+    def forward(self, W, Pi):
         #This function support Y as label integer or membership probablity.
+        '''
         if len(Y.shape)==1:
             #if Y is a label vector
             if num_classes is None:
@@ -41,8 +47,7 @@ class MaximalCodingRateReduction(torch.nn.Module):
             if num_classes is None:
                 num_classes = Y.shape[1]
             Pi = Y.T.reshape((num_classes,1,-1))
-            
-        W = X.T
+        '''    
         discrimn_loss = self.compute_discrimn_loss(W)
         compress_loss = self.compute_compress_loss(W, Pi)
  
