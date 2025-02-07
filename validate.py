@@ -208,7 +208,7 @@ def validate(args):
         crop_pct=crop_pct,
         pin_memory=args.pin_mem,
         tf_preprocessing=args.tf_preprocessing)
-
+    
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
@@ -281,6 +281,9 @@ def validate(args):
     return results
 
 
+
+
+
 def main():
     setup_default_logging()
     args = parser.parse_args()
@@ -343,6 +346,27 @@ def main():
             write_results(results_file, results)
     else:
         validate(args)
+
+
+@torch.no_grad()
+def throughput(data_loader, model, logger):
+    model.eval()
+
+    for idx, (images, _) in enumerate(data_loader):
+        images = images.cuda(non_blocking=True)
+        batch_size = images.shape[0]
+        for i in range(50):
+            model(images)
+        torch.cuda.synchronize()
+        logger.info(f"throughput averaged with 30 times")
+        tic1 = time.time()
+        for i in range(30):
+            model(images)
+        torch.cuda.synchronize()
+        tic2 = time.time()
+        logger.info(f"batch_size {batch_size} throughput {30 * batch_size / (tic2 - tic1)}")
+        return
+
 
 
 def write_results(results_file, results):

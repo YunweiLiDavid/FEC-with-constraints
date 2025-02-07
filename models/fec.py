@@ -1,14 +1,15 @@
 # Our model is build upon "Image as Set of Points", ICLR23. https://github.com/ma-xu/Context-Cluster/blob/main/models/context_cluster.py
 # Thanks the authors for their impressive work!
-import os
+import os,sys
 import copy
 import torch
 import torch.nn as nn
+sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from compute_constraint_loss import orthogonality_loss
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.layers import DropPath, trunc_normal_
 from timm.models.registry import register_model
-from timm.models.layers.helpers import to_2tuple
+from timm.layers.helpers import to_2tuple
 from einops import rearrange
 import torch.nn.functional as F
 from torch_scatter import scatter_sum
@@ -834,7 +835,7 @@ def get_flops1():
 if __name__ == '__main__':
     input = torch.rand(32, 3, 224, 224)
     model = fec_small()
-    out = model(input)
+    out, losses = model(input)
     print(model)
     print(out.shape)
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
