@@ -9,11 +9,14 @@ class MaximalCodingRateReduction(torch.nn.Module):
         
     def compute_discrimn_loss(self, W):
         """Discriminative Loss."""
-        p, m = W.shape
-        I = torch.eye(p,device=W.device)
+        '''
+        W: [B, C, N]
+        '''
+        B, p, m = W.shape
+        I = torch.eye(p,device=W.device).expand(B, p, p) 
         scalar = p / (m * self.eps)
-        logdet = torch.logdet(I + scalar * W.matmul(W.T))
-        return logdet / 2.
+        logdet = torch.logdet(I + scalar * W.matmul(W.transpose(-1, -2)))
+        return logdet.mean() / 2.  #  batch mean loss
     
     def compute_compress_loss(self, W, Pi):
         '''
@@ -21,19 +24,25 @@ class MaximalCodingRateReduction(torch.nn.Module):
         M: number of clusters
         N: number of points
         '''
-        p, m = W.shape
-        k, _, _ = Pi.shape
-        I = torch.eye(p,device=W.device).expand((k,p,p))
-        trPi = Pi.sum(2) + 1e-8
-        scale = (p/(trPi*self.eps)).view(k,1,1)
+        B, p, m = W.shape
+        print(W.shape)
+        B, k, _, _ = Pi.shape
+        print(Pi.shape)
+        I = torch.eye(p,device=W.device).expand((B,k,p,p))
+        trPi = Pi.sum(2, keepdim=True) + 1e-8
+        scale = (p/(trPi*self.eps)).view(B,k,1,1)
         
         W = W.view((1,p,m))
         log_det = torch.logdet(I + scale*W.mul(Pi).matmul(W.transpose(1,2)))
         compress_loss = (trPi.squeeze()*log_det/(2*m)).sum()
         return compress_loss
         
-    def forward(self, W, Pi):
+    def forward(self, X, mask):
         #This function support Y as label integer or membership probablity.
+        '''
+        M: number of clusters
+        N: number of points
+        '''
         '''
         if len(Y.shape)==1:
             #if Y is a label vector
@@ -48,6 +57,13 @@ class MaximalCodingRateReduction(torch.nn.Module):
                 num_classes = Y.shape[1]
             Pi = Y.T.reshape((num_classes,1,-1))
         '''    
+        B, C, W, H = X.shape
+
+        W = X.view(B, C, -1).permute(0, 2, 1)  # [B, C, W, H] -> [B, C, W*H]
+
+        # compute Pi
+        Pi = mask  #  [B, M, N]
+        Pi = Pi.unsqueeze(2)  #  [B, M, 1, N]
         discrimn_loss = self.compute_discrimn_loss(W)
         compress_loss = self.compute_compress_loss(W, Pi)
  
