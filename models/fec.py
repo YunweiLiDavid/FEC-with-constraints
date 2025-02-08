@@ -183,6 +183,7 @@ class Cluster(nn.Module):
         self.mcr = MaximalCodingRateReduction(eps=0.01,gamma=1.0)
 
     def forward(self, x):  # [b,c,w,h]
+        print("begin of cluster")
         value = self.v(x)
         x = self.f(x)
         x = rearrange(x, "b (e c) w h -> (b e) c w h", e=self.heads)
@@ -313,6 +314,7 @@ class ClusterBlock(nn.Module):
             self.layer_scale_2 = nn.Parameter(layer_scale_init_value * torch.ones((dim)), requires_grad=True)
 
     def forward(self, x):
+        print("begin of cluster block")
         out, cluster_losses = self.token_mixer(self.norm1(x))
         if self.use_layer_scale:
             x = x + self.drop_path(
@@ -508,14 +510,12 @@ class FEC(nn.Module):
 
     def forward_tokens(self, x):
         outs = []
-        losses = {"L_Clst": 0, "L_Sep": 0, "L_Orth": 0, "L_Entropy": 0}
+        loss = 0
         for idx, block in enumerate(self.network):
-            if isinstance(block, ClusterBlock):
-                x, block_losses = block(x)
-                losses["L_Clst"] += block_losses["L_Clst"]
-                losses["L_Sep"] += block_losses["L_Sep"]
-                losses["L_Orth"] += block_losses["L_Orth"]
-                losses["L_Entropy"] += block_losses["L_Entropy"]
+            if isinstance(block, torch.nn.Sequential):
+                for sub_idx, sub_block in enumerate(block):
+                    x, block_loss = sub_block(x)
+                    loss += block_loss
             elif isinstance(block, ClusterPool):
                 x = block(x)
             if self.fork_feat and idx in self.out_indices:
@@ -524,9 +524,9 @@ class FEC(nn.Module):
                 outs.append(x_out)
         if self.fork_feat:
             # output the features of four stages for dense prediction
-            return outs, losses
+            return outs, loss
         # output only the features of last layer for image classification
-        return x, losses
+        return x, loss
 
     def forward(self, x):
         # input embedding

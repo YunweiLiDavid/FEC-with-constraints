@@ -716,7 +716,7 @@ def train_one_epoch(
 
         with amp_autocast():
             output, losses = model(input)
-            loss = loss_fn(output, target) + losses['L_Clst'] + losses['L_Sep'] + losses['L_Orth'] + losses['L_Entropy']
+            loss = loss_fn(output, target) + losses
 
         if not args.distributed:
             losses_m.update(loss.item(), input.size(0))
@@ -821,7 +821,7 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                 output = output.unfold(0, reduce_factor, reduce_factor).mean(dim=2)
                 target = target[0:target.size(0):reduce_factor]
 
-            loss = loss_fn(output, target) + losses['L_Clst'] + losses['L_Sep'] + losses['L_Orth'] + losses['L_Entropy']
+            loss = loss_fn(output, target) 
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
             if args.distributed:
