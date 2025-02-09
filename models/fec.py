@@ -4,7 +4,6 @@ import os
 import copy
 import torch
 import torch.nn as nn
-from compute_constraint_loss import orthogonality_loss
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.layers import DropPath, trunc_normal_
 from timm.models.registry import register_model
@@ -180,10 +179,9 @@ class Cluster(nn.Module):
         self.centers_proposal = nn.AdaptiveAvgPool2d((proposal_w, proposal_h))
         self.fold_w = fold_w
         self.fold_h = fold_h
-        self.mcr = MaximalCodingRateReduction(eps=0.01,gamma=1.0)
+        self.mcr = MaximalCodingRateReduction(eps=0.01,gamma=0.01)
 
     def forward(self, x):  # [b,c,w,h]
-        print("begin of cluster")
         value = self.v(x)
         x = self.f(x)
         x = rearrange(x, "b (e c) w h -> (b e) c w h", e=self.heads)
@@ -234,14 +232,15 @@ class Cluster(nn.Module):
         # dispatch step, return to each point in a cluster
         out = (out.unsqueeze(dim=2) * sim.unsqueeze(dim=-1)).sum(dim=1)  # [B,N,D]
         out = rearrange(out, "b (w h) c -> b c w h", w=w)
-
+        mcr_loss, _ = self.mcr(out, mask)
         if self.fold_w > 1 and self.fold_h > 1:
             # recover the splited regions back to big feature maps if use the region partition.
             out = rearrange(out, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
         out = rearrange(out, "(b e) c w h -> b (e c) w h", e=self.heads)
+        
         out = self.proj(out)
         #compute mcr loss of NMCE
-        mcr_loss, _ = self.mcr(out, mask)
+        
         return out, mcr_loss
 
 
@@ -314,7 +313,6 @@ class ClusterBlock(nn.Module):
             self.layer_scale_2 = nn.Parameter(layer_scale_init_value * torch.ones((dim)), requires_grad=True)
 
     def forward(self, x):
-        print("begin of cluster block")
         out, cluster_losses = self.token_mixer(self.norm1(x))
         if self.use_layer_scale:
             x = x + self.drop_path(
@@ -823,13 +821,13 @@ def get_flops1():
 if __name__ == '__main__':
     input = torch.rand(32, 3, 224, 224)
     model = fec_small()
-    out = model(input)
+    out, loss = model(input)
     print(model)
     print(out.shape)
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("number of params: {:.2f}M".format(n_parameters/1024**2))
-
+    
     for i in range(3):
         print(compute_throughput(model), end=' ')
-
+    
     get_flops1()
