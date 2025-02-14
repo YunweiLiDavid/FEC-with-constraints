@@ -405,7 +405,7 @@ def main():
             f'Model {safe_model_name(args.model)} created, param count:{sum([m.numel() for m in model.parameters()])}')
 
     data_config = resolve_data_config(vars(args), model=model, verbose=args.local_rank == 0)
-
+    print(data_config)
     # setup augmentation batch splits for contrastive loss or split bn
     num_aug_splits = 0
     if args.aug_splits > 0:
@@ -713,7 +713,7 @@ def train_one_epoch(
             input = input.contiguous(memory_format=torch.channels_last)
 
         with amp_autocast():
-            output, losses = model(input)
+            output = model(input)
             '''
             _logger.info(f'Loss: {losses}')
             _logger.info(f'L_Clst Loss: {losses["L_Clst"]}')
@@ -721,7 +721,7 @@ def train_one_epoch(
             _logger.info(f'L_Orth Loss: {losses["L_Orth"]}')
             _logger.info(f'L_Entropy Loss: {losses["L_Entropy"]}')
             '''
-            loss = loss_fn(output, target) + 0.1*losses['L_Clst'] + 0.1*losses['L_Sep'] + 0.01*losses['L_Entropy'] + 0.0001*losses['L_Orth']
+            loss = loss_fn(output, target) 
 
         if not args.distributed:
             losses_m.update(loss.item(), input.size(0))
@@ -816,7 +816,7 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                 input = input.contiguous(memory_format=torch.channels_last)
 
             with amp_autocast():
-                output, losses = model(input)
+                output = model(input)
             if isinstance(output, (tuple, list)):
                 output = output[0]
 
@@ -826,7 +826,7 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                 output = output.unfold(0, reduce_factor, reduce_factor).mean(dim=2)
                 target = target[0:target.size(0):reduce_factor]
 
-            loss = loss_fn(output, target) + 0.1*losses['L_Clst'] + 0.1*losses['L_Sep'] + 0.01*losses['L_Entropy'] + 0.0001*losses['L_Orth'] 
+            loss = loss_fn(output, target) 
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
             if args.distributed:
