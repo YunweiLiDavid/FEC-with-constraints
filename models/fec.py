@@ -130,7 +130,6 @@ class ClusterPool(nn.Module):
             out = rearrange(out, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
 
         out = identity + self.norm2(out)
-        
         return out
 
 
@@ -181,12 +180,18 @@ class Cluster(nn.Module):
         self.centers_proposal = nn.AdaptiveAvgPool2d((proposal_w, proposal_h))
         self.fold_w = fold_w
         self.fold_h = fold_h
+        #agent_num = 
+        #pool_size = int(agent_num ** 0.5)  # 确保 agent_num 是一个平方数
+        #self.pool = nn.AdaptiveAvgPool2d(output_size=(pool_size, pool_size))
+
+
 
     def forward(self, x):  # [b,c,w,h]
         value = self.v(x)
         x = self.f(x)
         x = rearrange(x, "b (e c) w h -> (b e) c w h", e=self.heads)
         value = rearrange(value, "b (e c) w h -> (b e) c w h", e=self.heads)
+       
         if self.fold_w > 1 and self.fold_h > 1:
             # split the big feature maps to small local regions to reduce computations.
             b0, c0, w0, h0 = x.shape
@@ -195,10 +200,11 @@ class Cluster(nn.Module):
             x = rearrange(x, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w,
                           f2=self.fold_h)  # [bs*blocks,c,ks[0],ks[1]]
             value = rearrange(value, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w, f2=self.fold_h)
-        b, c, w, h = x.shape
+        b, c, w, h = x.shape 
+        print(x.shape)
         centers = self.centers_proposal(x)  # [b,c,C_W,C_H], we set M = C_W*C_H and N = w*h
         value_centers = rearrange(self.centers_proposal(value), 'b c w h -> b (w h) c')  # [b,C_W,C_H,c]
-
+        print(centers.shape)
         b, c, ww, hh = centers.shape
         sim = torch.sigmoid(
             self.sim_beta +
@@ -234,7 +240,7 @@ class Cluster(nn.Module):
             out = rearrange(out, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
         out = rearrange(out, "(b e) c w h -> b (e c) w h", e=self.heads)
         out = self.proj(out)
-        return out, {"L_Sep": L_Sep, "L_Orth": L_Orth, "L_Entropy": L_Entropy}
+        return out
 
 
 class Mlp(nn.Module):
@@ -306,7 +312,7 @@ class ClusterBlock(nn.Module):
             self.layer_scale_2 = nn.Parameter(layer_scale_init_value * torch.ones((dim)), requires_grad=True)
 
     def forward(self, x):
-        out, cluster_losses = self.token_mixer(self.norm1(x))
+        out = self.token_mixer(self.norm1(x))
         if self.use_layer_scale:
             x = x + self.drop_path(
                 self.layer_scale_1.unsqueeze(-1).unsqueeze(-1)
@@ -317,7 +323,7 @@ class ClusterBlock(nn.Module):
         else:
             x = x + self.drop_path(out)
             x = x + self.drop_path(self.mlp(self.norm2(x)))
-        return x, cluster_losses
+        return x
 
 
 def basic_blocks(dim, index, layers,
