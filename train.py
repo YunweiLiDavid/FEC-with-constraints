@@ -721,8 +721,7 @@ def train_one_epoch(
             _logger.info(f'L_Orth Loss: {losses["L_Orth"]}')
             _logger.info(f'L_Entropy Loss: {losses["L_Entropy"]}')
             '''
-            loss = loss_fn(output, target) + 0.1*losses['L_Clst'] + 0.1*losses['L_Sep'] + 0.01*losses['L_Entropy'] + 0.0001*losses['L_Orth']
-
+            loss = loss_fn(output, target) + 0.1*losses['L_Clst']  + 0.1*losses['L_Sep'] + 0.01*losses['L_Entropy'] #+ 0.0001*losses['L_Orth']
         if not args.distributed:
             losses_m.update(loss.item(), input.size(0))
 
@@ -826,7 +825,7 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                 output = output.unfold(0, reduce_factor, reduce_factor).mean(dim=2)
                 target = target[0:target.size(0):reduce_factor]
 
-            loss = loss_fn(output, target) + 0.1*losses['L_Clst'] + 0.1*losses['L_Sep'] + 0.01*losses['L_Entropy'] + 0.0001*losses['L_Orth'] 
+            loss = loss_fn(output, target) + 0.1*losses['L_Clst'] + 0.1*losses['L_Sep']  + 0.01*losses['L_Entropy']# + 0.0001*losses['L_Orth']
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
             if args.distributed:

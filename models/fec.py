@@ -210,10 +210,10 @@ class Cluster(nn.Module):
 
         # we use mask to sololy assign each point to one center
         sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
-
+        
         # 1. compute cluster loss
         L_Clst = -torch.mean(sim_max)  
-
+        
         mask = torch.zeros_like(sim)  # binary #[B,M,N]
         mask.scatter_(1, sim_max_idx, 1.)
 
@@ -227,11 +227,11 @@ class Cluster(nn.Module):
         
         #3. compute orthogonality loss
         L_Orth = orthogonality_loss(centers)
-        
+        '''
         #4. balance regularization
         cluster_probs = mask.sum(dim=-1) / mask.size(-1)  # [B, M]，probability of hard assignment
         L_Entropy = -torch.mean(torch.sum(cluster_probs * torch.log(cluster_probs + 1e-6), dim=-1))
-        
+        '''
         sim = sim * mask
         value2 = rearrange(value, 'b c w h -> b (w h) c')  # [B,N,D]
         # aggregate step, out shape [B,M,D]
@@ -252,7 +252,7 @@ class Cluster(nn.Module):
             out = rearrange(out, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
         out = rearrange(out, "(b e) c w h -> b (e c) w h", e=self.heads)
         out = self.proj(out)
-        return out, {"L_Clst": L_Clst, "L_Sep": L_Sep, "L_Orth": L_Orth, "L_Entropy": L_Entropy}
+        return out, {"L_Orth": L_Orth,  "L_Clst": L_Clst, "L_Sep": L_Sep }
 
 
 class Mlp(nn.Module):
@@ -519,7 +519,7 @@ class FEC(nn.Module):
 
     def forward_tokens(self, x):
         outs = []
-        losses = {"L_Clst": 0, "L_Sep": 0, "L_Orth": 0, "L_Entropy": 0}
+        losses = {"L_Sep": 0, "L_Orth": 0, "L_Clst": 0 }
         for idx, block in enumerate(self.network):
             if isinstance(block, torch.nn.Sequential):
                 for sub_idx, sub_block in enumerate(block):
@@ -527,7 +527,7 @@ class FEC(nn.Module):
                     losses["L_Clst"] += block_losses["L_Clst"]
                     losses["L_Sep"] += block_losses["L_Sep"]
                     losses["L_Orth"] += block_losses["L_Orth"]
-                    losses["L_Entropy"] += block_losses["L_Entropy"]
+                    #losses["L_Entropy"] += block_losses["L_Entropy"]
             elif isinstance(block, ClusterPool):
                 x = block(x)
             if self.fork_feat and idx in self.out_indices:
