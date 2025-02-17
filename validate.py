@@ -19,8 +19,8 @@ import torch.nn.parallel
 from collections import OrderedDict
 from contextlib import suppress
 
-
-from timm.models import apply_test_time_pool, create_model, load_checkpoint, is_model, list_models
+from timm.layers import apply_test_time_pool
+from timm.models import create_model, load_checkpoint, is_model, list_models
 from timm.data import create_dataset, create_loader, resolve_data_config, RealLabelsImagenet
 from timm.utils import accuracy, AverageMeter, natural_key, setup_default_logging, set_jit_legacy
 
@@ -235,7 +235,7 @@ def validate(args):
 
             if valid_labels is not None:
                 output = output[:, valid_labels]
-            loss = criterion(output, target) + 0.1*constraint_losses['L_Clst'] + 0.1*constraint_losses['L_Sep'] + 0.01*constraint_losses['L_Entropy'] + 0.0001*constraint_losses['L_Orth']
+            loss = criterion(output, target) + 0.1*constraint_losses['L_Clst'] + 0.0001*constraint_losses['L_Orth'] + 0.1*constraint_losses['L_Sep'] #+ 0.01*constraint_losses['L_Entropy'] 
 
 
             if real_labels is not None:
