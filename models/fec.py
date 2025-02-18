@@ -189,14 +189,11 @@ class Cluster(nn.Module):
     def forward(self, x):  # [b,c,w,h]
         value = self.v(x)
         x = self.f(x)
+        print("X",x.shape)
         x = rearrange(x, "b (e c) w h -> (b e) c w h", e=self.heads)
         value = rearrange(value, "b (e c) w h -> (b e) c w h", e=self.heads)
-        print(x.shape)
-        agent_tokens = self.pool(x) # [b, c, pool_size, pool_size]
-        print(agent_tokens.shape)
-
-        agent_tokens = agent_tokens.flatten(2).transpose(1, 2)  # [B, agent_num, C]
-
+        print("X",x.shape)
+       
         if self.fold_w > 1 and self.fold_h > 1:
             # split the big feature maps to small local regions to reduce computations.
             b0, c0, w0, h0 = x.shape
@@ -206,7 +203,15 @@ class Cluster(nn.Module):
                           f2=self.fold_h)  # [bs*blocks,c,ks[0],ks[1]]
             value = rearrange(value, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w, f2=self.fold_h)
         b, c, w, h = x.shape 
-        print(x.shape)
+        print("X",x.shape)
+        agent_tokens = self.pool(x) # [b, c, pool_size, pool_size]
+        print("A",agent_tokens.shape)
+
+        agent_tokens = agent_tokens.flatten(2).transpose(1, 2)  # [B, agent_num, C]
+        print("A",agent_tokens.shape)
+
+
+        
         centers = self.centers_proposal(x)  # [b,c,C_W,C_H], we set M = C_W*C_H and N = w*h
         value_centers = rearrange(self.centers_proposal(value), 'b c w h -> b (w h) c')  # [b,C_W,C_H,c]
         print(centers.shape)
@@ -214,15 +219,15 @@ class Cluster(nn.Module):
         sim = torch.sigmoid(
             self.sim_beta +
             self.sim_alpha * pairwise_cos_sim(
-                centers.reshape(b, c, -1).permute(0, 2, 1),
-                x.reshape(b, c, -1).permute(0, 2, 1)
+                centers.reshape(b, c, -1).permute(0, 2, 1),  # [b, M, c]
+                agent_tokens  # [b, A, c]
             )
-        )  # [B,M,N]
+        )  # [B,M,A]
 
         # we use mask to sololy assign each point to one center
         sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
 
-        mask = torch.zeros_like(sim)  # binary #[B,M,N]
+        mask = torch.zeros_like(sim)  # binary #[B,M,A]
         mask.scatter_(1, sim_max_idx, 1.)
 
         sim = sim * mask
