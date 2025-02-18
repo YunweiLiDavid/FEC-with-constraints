@@ -158,7 +158,7 @@ def pairwise_cos_sim(x1: torch.Tensor, x2: torch.Tensor):
 
 
 class Cluster(nn.Module):
-    def __init__(self, dim, out_dim, proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24):
+    def __init__(self, dim, out_dim, proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24, agent_num=49):
         """
         :param dim:  channel nubmer
         :param out_dim: channel nubmer
@@ -180,9 +180,9 @@ class Cluster(nn.Module):
         self.centers_proposal = nn.AdaptiveAvgPool2d((proposal_w, proposal_h))
         self.fold_w = fold_w
         self.fold_h = fold_h
-        #agent_num = 
-        #pool_size = int(agent_num ** 0.5)  # 确保 agent_num 是一个平方数
-        #self.pool = nn.AdaptiveAvgPool2d(output_size=(pool_size, pool_size))
+        #add agent number
+        pool_size = int(agent_num ** 0.5)  
+        self.pool = nn.AdaptiveAvgPool2d(output_size=(pool_size, pool_size))
 
 
 
@@ -191,7 +191,12 @@ class Cluster(nn.Module):
         x = self.f(x)
         x = rearrange(x, "b (e c) w h -> (b e) c w h", e=self.heads)
         value = rearrange(value, "b (e c) w h -> (b e) c w h", e=self.heads)
-       
+        print(x.shape)
+        agent_tokens = self.pool(x) # [b, c, pool_size, pool_size]
+        print(agent_tokens.shape)
+
+        agent_tokens = agent_tokens.flatten(2).transpose(1, 2)  # [B, agent_num, C]
+
         if self.fold_w > 1 and self.fold_h > 1:
             # split the big feature maps to small local regions to reduce computations.
             b0, c0, w0, h0 = x.shape
@@ -293,13 +298,13 @@ class ClusterBlock(nn.Module):
                  act_layer=nn.GELU, norm_layer=GroupNorm,
                  drop=0., drop_path=0.,
                  use_layer_scale=True, layer_scale_init_value=1e-5,
-                 proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24):
+                 proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24, agent_num=49):
 
         super().__init__()
 
         self.norm1 = norm_layer(dim)
         self.token_mixer = Cluster(dim=dim, out_dim=dim, proposal_w=proposal_w, proposal_h=proposal_h,
-                                   fold_w=fold_w, fold_h=fold_h, heads=heads, head_dim=head_dim)
+                                   fold_w=fold_w, fold_h=fold_h, heads=heads, head_dim=head_dim, agent_num=agent_num)
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim,
@@ -331,7 +336,7 @@ def basic_blocks(dim, index, layers,
                  act_layer=nn.GELU, norm_layer=GroupNorm,
                  drop_rate=.0, drop_path_rate=0.,
                  use_layer_scale=True, layer_scale_init_value=1e-5,
-                 proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24):
+                 proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24, agent_num=49):
     blocks = []
     for block_idx in range(layers[index]):
         block_dpr = drop_path_rate * ( block_idx + sum(layers[:index])) / (sum(layers) - 1)
@@ -342,7 +347,7 @@ def basic_blocks(dim, index, layers,
             use_layer_scale=use_layer_scale,
             layer_scale_init_value=layer_scale_init_value,
             proposal_w=proposal_w, proposal_h=proposal_h, fold_w=fold_w, fold_h=fold_h,
-            heads=heads, head_dim=head_dim
+            heads=heads, head_dim=head_dim, agent_num=agent_num
         ))
     blocks = nn.Sequential(*blocks)
 
@@ -378,7 +383,7 @@ class FEC(nn.Module):
                  init_cfg=None,
                  pretrained=None,
                  proposal_w=[2, 2, 2, 2], proposal_h=[2, 2, 2, 2], fold_w=[8, 4, 2, 1], fold_h=[8, 4, 2, 1],
-                 heads=[2, 4, 6, 8], head_dim=[16, 16, 32, 32], **kwargs):
+                 heads=[2, 4, 6, 8], head_dim=[16, 16, 32, 32], agent_num=[49, 49, 49, 49], **kwargs):
 
         super().__init__()
 
@@ -392,6 +397,7 @@ class FEC(nn.Module):
 
         # set the main block in network
         network = []
+        print(len(layers))
         for i in range(len(layers)):
             stage = basic_blocks(embed_dims[i], i, layers,
                                  mlp_ratio=mlp_ratios[i],
@@ -402,6 +408,7 @@ class FEC(nn.Module):
                                  layer_scale_init_value=layer_scale_init_value,
                                  proposal_w=proposal_w[i], proposal_h=proposal_h[i],
                                  fold_w=fold_w[i], fold_h=fold_h[i], heads=heads[i], head_dim=head_dim[i],
+                                 agent_num=agent_num[i]
                                  )
             network.append(stage)
             if i >= len(layers) - 1:
@@ -553,12 +560,13 @@ def fec_small(pretrained=False, **kwargs):
     head_dim = [24, 24, 24, 24]
     down_patch_size = 3
     down_pad = 1
+    agent_num=[49, 49, 49, 49]
     model = FEC(
         layers, embed_dims=embed_dims, norm_layer=norm_layer,
         mlp_ratios=mlp_ratios, downsamples=downsamples,
         down_patch_size=down_patch_size, down_pad=down_pad,
         proposal_w=proposal_w, proposal_h=proposal_h, fold_w=fold_w, fold_h=fold_h,
-        heads=heads, head_dim=head_dim, **kwargs)
+        heads=heads, head_dim=head_dim, agent_num=agent_num, **kwargs)
     model.default_cfg = default_cfgs['model_small']
     return model
 
@@ -655,12 +663,13 @@ if has_mmdet:
                 head_dim = [32, 32, 32, 32]
                 down_patch_size = 3
                 down_pad = 1
+                agent_num=[49, 49, 49, 49]
                 super().__init__(
                     layers, embed_dims=embed_dims, norm_layer=norm_layer,
                     mlp_ratios=mlp_ratios, downsamples=downsamples,
                     down_patch_size = down_patch_size, down_pad=down_pad,
                     proposal_w=proposal_w, proposal_h=proposal_h, fold_w=fold_w, fold_h=fold_h,
-                    heads=heads, head_dim=head_dim, fork_feat=True, **kwargs)
+                    heads=heads, head_dim=head_dim, agent_num=agent_num, fork_feat=True, **kwargs)
     
     @seg_BACKBONES.register_module()
     @det_BACKBONES.register_module()
