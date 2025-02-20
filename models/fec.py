@@ -81,7 +81,7 @@ class ClusterPool(nn.Module):
     Output: tensor in shape [B, embed_dim, H/stride, W/stride]
     """
 
-    def __init__(self, stride=4, in_chans=5, embed_dim=64, norm_layer=None, fold_w=1, fold_h=1):
+    def __init__(self, stride=4, in_chans=5, embed_dim=64, norm_layer=None, fold_w=1, fold_h=1, agent_num=49):
         super().__init__()
         self.norm2 = GroupNorm(embed_dim)
         self.stride = stride
@@ -90,6 +90,11 @@ class ClusterPool(nn.Module):
         self.conv_skip = nn.Conv2d(in_chans, embed_dim, kernel_size=3, padding=1, stride=2)  # for skip connection
         self.fold_w = fold_w
         self.fold_h = fold_h
+        #add agent number
+        pool_size = int(agent_num ** 0.5)  
+        self.pool = nn.AdaptiveAvgPool2d(output_size=(pool_size, pool_size))
+
+        
 
     def forward(self, x):
         identity = self.conv_skip(x)
@@ -105,25 +110,35 @@ class ClusterPool(nn.Module):
                           f2=self.fold_h)  # [bs*blocks,c,ks[0],ks[1]]
             value = rearrange(value, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w, f2=self.fold_h)
         
+        
         b, c, w, h = x.shape
+
+        #print("X",x.shape)
+        agent_tokens = self.pool(x) # [b, c, pool_size, pool_size]
+        #print("A",agent_tokens.shape)
+
+        agent_tokens = agent_tokens.flatten(2).transpose(1, 2)  # [B, agent_num, C]
+        #print("A",agent_tokens.shape)
+
         centers = F.adaptive_avg_pool2d(x, (w // self.stride, h // self.stride))
         value_centers = rearrange(F.adaptive_avg_pool2d(value, (w // self.stride, h // self.stride)), 'b c w h -> b (w h) c')
         b, c, ww, hh = centers.shape
-        sim = pairwise_cos_sim( centers.reshape(b, c, -1).permute(0, 2, 1), x.reshape(b, c, -1).permute(0, 2, 1) )  # [B,M,N]
+        sim = pairwise_cos_sim( centers.reshape(b, c, -1).permute(0, 2, 1), agent_tokens )  # [B,M,A]
         # we use mask to sololy assign each point to one center
         sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
-        mask = torch.zeros_like(sim)  # binary #[B,M,N]
+        mask = torch.zeros_like(sim)  # binary #[B,M,A]
         mask.scatter_(1, sim_max_idx, 1.)
-        value2 = rearrange(value, 'b c w h -> b (w h) c')  # [B,N,D]
+        value_agent = self.pool(value)  # [b, c, pool_size, pool_size]
+        value2 = rearrange(value_agent, 'b c w h -> b (w h) c')  # [B,A,D]
         # aggregate step, out shape [B,M,D]
-        M, N = value_centers.shape[1], value2.shape[1]
+        M, A = value_centers.shape[1], value2.shape[1]
         value2 = rearrange(value2, 'b n c -> (b n) c')
         sim_max_idx = rearrange(sim_max_idx.squeeze(1), 'b n -> (b n)')
-        idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, N).flatten()
+        idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, A).flatten()
         sim_max_idx = sim_max_idx + idx_offset
         out = rearrange(scatter_sum(value2, sim_max_idx, dim=0, dim_size=b*M), '(b m) c -> b m c', b=b, m=M)  # Different from CoC's implementation "(value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2)", we use scatter_sum to avoid OOM.
         out = (out + value_centers) / (mask.sum(dim=-1, keepdim=True) + 1.0)
-
+        #print("out pool",out.shape)#B M D
         out = rearrange(out, 'b (w h) c -> b c w h', w=ww, h=hh)
         if self.fold_w > 1 and self.fold_h > 1:
             # recover the splited regions back to big feature maps if use the region partition.
@@ -189,11 +204,8 @@ class Cluster(nn.Module):
     def forward(self, x):  # [b,c,w,h]
         value = self.v(x)
         x = self.f(x)
-        print("X",x.shape)
         x = rearrange(x, "b (e c) w h -> (b e) c w h", e=self.heads)
         value = rearrange(value, "b (e c) w h -> (b e) c w h", e=self.heads)
-        print("X",x.shape)
-       
         if self.fold_w > 1 and self.fold_h > 1:
             # split the big feature maps to small local regions to reduce computations.
             b0, c0, w0, h0 = x.shape
@@ -202,34 +214,21 @@ class Cluster(nn.Module):
             x = rearrange(x, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w,
                           f2=self.fold_h)  # [bs*blocks,c,ks[0],ks[1]]
             value = rearrange(value, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w, f2=self.fold_h)
-        b, c, w, h = x.shape 
-        print("X",x.shape)
-        agent_tokens = self.pool(x) # [b, c, pool_size, pool_size]
-        print("A",agent_tokens.shape)
-
-        agent_tokens = agent_tokens.flatten(2).transpose(1, 2)  # [B, agent_num, C]
-        print("A",agent_tokens.shape)
-
-
-        
+        b, c, w, h = x.shape
         centers = self.centers_proposal(x)  # [b,c,C_W,C_H], we set M = C_W*C_H and N = w*h
         value_centers = rearrange(self.centers_proposal(value), 'b c w h -> b (w h) c')  # [b,C_W,C_H,c]
-        print(centers.shape)
         b, c, ww, hh = centers.shape
         sim = torch.sigmoid(
             self.sim_beta +
             self.sim_alpha * pairwise_cos_sim(
-                centers.reshape(b, c, -1).permute(0, 2, 1),  # [b, M, c]
-                agent_tokens  # [b, A, c]
+                centers.reshape(b, c, -1).permute(0, 2, 1),
+                x.reshape(b, c, -1).permute(0, 2, 1)
             )
-        )  # [B,M,A]
-
+        )  # [B,M,N]
         # we use mask to sololy assign each point to one center
         sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
-
-        mask = torch.zeros_like(sim)  # binary #[B,M,A]
+        mask = torch.zeros_like(sim)  # binary #[B,M,N]
         mask.scatter_(1, sim_max_idx, 1.)
-
         sim = sim * mask
         value2 = rearrange(value, 'b c w h -> b (w h) c')  # [B,N,D]
         # aggregate step, out shape [B,M,D]
@@ -420,7 +419,7 @@ class FEC(nn.Module):
                 break
             if downsamples[i] or embed_dims[i] != embed_dims[i + 1]:
                 # downsampling between two stages
-                network.append( ClusterPool(down_stride, embed_dims[i], embed_dims[i + 1], fold_w=fold_w[i+1], fold_h=fold_h[i+1]) )
+                network.append( ClusterPool(down_stride, embed_dims[i], embed_dims[i + 1], fold_w=fold_w[i+1], fold_h=fold_h[i+1], agent_num=agent_num[i+1]) )
 
         self.network = nn.ModuleList(network)
 
@@ -565,7 +564,7 @@ def fec_small(pretrained=False, **kwargs):
     head_dim = [24, 24, 24, 24]
     down_patch_size = 3
     down_pad = 1
-    agent_num=[49, 49, 49, 49]
+    agent_num=[49, 49, 25, 25]
     model = FEC(
         layers, embed_dims=embed_dims, norm_layer=norm_layer,
         mlp_ratios=mlp_ratios, downsamples=downsamples,
@@ -833,7 +832,7 @@ def get_flops1():
 if __name__ == '__main__':
     input = torch.rand(32, 3, 224, 224)
     model = fec_small()
-    out, losses = model(input)
+    out = model(input)
     print(model)
     print(out.shape)
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
