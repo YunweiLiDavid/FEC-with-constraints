@@ -121,6 +121,7 @@ class ClusterPool(nn.Module):
         #print("A",agent_tokens.shape)
 
         centers = F.adaptive_avg_pool2d(x, (w // self.stride, h // self.stride))
+        #print("centers",centers.shape)
         value_centers = rearrange(F.adaptive_avg_pool2d(value, (w // self.stride, h // self.stride)), 'b c w h -> b (w h) c')
         b, c, ww, hh = centers.shape
         sim = pairwise_cos_sim( centers.reshape(b, c, -1).permute(0, 2, 1), agent_tokens )  # [B,M,A]
@@ -196,8 +197,8 @@ class Cluster(nn.Module):
         self.fold_w = fold_w
         self.fold_h = fold_h
         #add agent number
-        pool_size = int(agent_num ** 0.5)  
-        self.pool = nn.AdaptiveAvgPool2d(output_size=(pool_size, pool_size))
+        self.pool_size = int(agent_num ** 0.5)  
+        self.pool = nn.AdaptiveAvgPool2d(output_size=(self.pool_size, self.pool_size))
 
 
 
@@ -215,6 +216,14 @@ class Cluster(nn.Module):
                           f2=self.fold_h)  # [bs*blocks,c,ks[0],ks[1]]
             value = rearrange(value, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w, f2=self.fold_h)
         b, c, w, h = x.shape
+
+        #print("X",x.shape)
+        agent_tokens = self.pool(x) # [b, c, pool_size, pool_size]
+        #print("A",agent_tokens.shape)
+        agent_tokens = agent_tokens.flatten(2).transpose(1, 2)  # [B, agent_num, C]
+        #print("A",agent_tokens.shape)
+        value_agent = self.pool(value)  # [b, c, pool_size, pool_size]
+
         centers = self.centers_proposal(x)  # [b,c,C_W,C_H], we set M = C_W*C_H and N = w*h
         value_centers = rearrange(self.centers_proposal(value), 'b c w h -> b (w h) c')  # [b,C_W,C_H,c]
         b, c, ww, hh = centers.shape
@@ -222,7 +231,7 @@ class Cluster(nn.Module):
             self.sim_beta +
             self.sim_alpha * pairwise_cos_sim(
                 centers.reshape(b, c, -1).permute(0, 2, 1),
-                x.reshape(b, c, -1).permute(0, 2, 1)
+                agent_tokens
             )
         )  # [B,M,N]
         # we use mask to sololy assign each point to one center
@@ -230,25 +239,29 @@ class Cluster(nn.Module):
         mask = torch.zeros_like(sim)  # binary #[B,M,N]
         mask.scatter_(1, sim_max_idx, 1.)
         sim = sim * mask
-        value2 = rearrange(value, 'b c w h -> b (w h) c')  # [B,N,D]
+        value2 = rearrange(value_agent, 'b c w h -> b (w h) c')  # [B,N,D]
         # aggregate step, out shape [B,M,D]
-        M, N = value_centers.shape[1], value2.shape[1]
+        M, A = value_centers.shape[1], value2.shape[1]
         value2 = rearrange(value2, 'b n c -> (b n) c')
         sim_max_idx = rearrange(sim_max_idx.squeeze(1), 'b n -> (b n)')
-        idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, N).flatten()
+        idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, A).flatten()
         sim_max_idx = sim_max_idx + idx_offset
         out = rearrange(scatter_sum(value2, sim_max_idx, dim=0, dim_size=b*M), '(b m) c -> b m c', b=b, m=M)  # Different from CoC's implementation "(value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2)", we use scatter_sum to avoid OOM.
         out = (out + value_centers) / (mask.sum(dim=-1, keepdim=True) + 1.0)
 
         # dispatch step, return to each point in a cluster
         out = (out.unsqueeze(dim=2) * sim.unsqueeze(dim=-1)).sum(dim=1)  # [B,N,D]
-        out = rearrange(out, "b (w h) c -> b c w h", w=w)
+        out = rearrange(out, "b (w h) c -> b c w h", w=self.pool_size)
 
         if self.fold_w > 1 and self.fold_h > 1:
             # recover the splited regions back to big feature maps if use the region partition.
             out = rearrange(out, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
         out = rearrange(out, "(b e) c w h -> b (e c) w h", e=self.heads)
+
         out = self.proj(out)
+
+        out = F.interpolate(out, size=(w, h), mode='bilinear', align_corners=False)
+
         return out
 
 
@@ -518,7 +531,6 @@ class FEC(nn.Module):
 
     def forward_tokens(self, x):
         outs = []
-        losses = {"L_Sep": 0,  "L_Orth": 0, "L_Entropy": 0}
         for idx, block in enumerate(self.network):
             if isinstance(block, torch.nn.Sequential):
                 for sub_idx, sub_block in enumerate(block):
