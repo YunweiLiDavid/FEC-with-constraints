@@ -259,7 +259,6 @@ class Cluster(nn.Module):
         out = rearrange(out, "(b e) c w h -> b (e c) w h", e=self.heads)
 
         out = self.proj(out)
-
         out = F.interpolate(out, size=(w, h), mode='bilinear', align_corners=False)
 
         return out
