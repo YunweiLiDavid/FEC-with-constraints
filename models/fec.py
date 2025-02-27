@@ -107,6 +107,14 @@ class ClusterPool(nn.Module):
         
         b, c, w, h = x.shape
         centers = F.adaptive_avg_pool2d(x, (w // self.stride, h // self.stride))
+
+
+        for _ in range(self.iters):
+
+
+
+
+
         value_centers = rearrange(F.adaptive_avg_pool2d(value, (w // self.stride, h // self.stride)), 'b c w h -> b (w h) c')
         b, c, ww, hh = centers.shape
         sim = pairwise_cos_sim( centers.reshape(b, c, -1).permute(0, 2, 1), x.reshape(b, c, -1).permute(0, 2, 1) )  # [B,M,N]
