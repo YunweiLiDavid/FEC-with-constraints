@@ -199,7 +199,8 @@ class Cluster(nn.Module):
         #add agent number
         self.pool_size = int(agent_num ** 0.5)  
         self.pool = nn.AdaptiveAvgPool2d(output_size=(self.pool_size, self.pool_size))
-
+        self.dim = dim
+        self.out_dim = out_dim
 
 
     def forward(self, x):  # [b,c,w,h]
@@ -259,8 +260,7 @@ class Cluster(nn.Module):
         out = rearrange(out, "(b e) c w h -> b (e c) w h", e=self.heads)
 
         out = self.proj(out)
-        out = F.interpolate(out, size=(w, h), mode='bilinear', align_corners=False)
-
+        out = F.interpolate(out, size=(w, h), mode='area')
         return out
 
 
