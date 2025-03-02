@@ -90,7 +90,7 @@ class ClusterPool(nn.Module):
         self.conv_skip = nn.Conv2d(in_chans, embed_dim, kernel_size=3, padding=1, stride=2)  # for skip connection
         self.fold_w = fold_w
         self.fold_h = fold_h
-
+        self.iters = 3
     def forward(self, x):
         identity = self.conv_skip(x)
         value = self.conv_v(x)
@@ -109,35 +109,37 @@ class ClusterPool(nn.Module):
         centers = F.adaptive_avg_pool2d(x, (w // self.stride, h // self.stride))
 
 
-        for _ in range(self.iters):
-
-
-
-
-
+        ''''''
         value_centers = rearrange(F.adaptive_avg_pool2d(value, (w // self.stride, h // self.stride)), 'b c w h -> b (w h) c')
-        b, c, ww, hh = centers.shape
-        sim = pairwise_cos_sim( centers.reshape(b, c, -1).permute(0, 2, 1), x.reshape(b, c, -1).permute(0, 2, 1) )  # [B,M,N]
-        # we use mask to sololy assign each point to one center
-        sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
-        mask = torch.zeros_like(sim)  # binary #[B,M,N]
-        mask.scatter_(1, sim_max_idx, 1.)
         value2 = rearrange(value, 'b c w h -> b (w h) c')  # [B,N,D]
-        # aggregate step, out shape [B,M,D]
-        M, N = value_centers.shape[1], value2.shape[1]
+        
+        M, N = centers.shape[2]*centers.shape[3], value2.shape[1]
         value2 = rearrange(value2, 'b n c -> (b n) c')
-        sim_max_idx = rearrange(sim_max_idx.squeeze(1), 'b n -> (b n)')
-        idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, N).flatten()
-        sim_max_idx = sim_max_idx + idx_offset
-        out = rearrange(scatter_sum(value2, sim_max_idx, dim=0, dim_size=b*M), '(b m) c -> b m c', b=b, m=M)  # Different from CoC's implementation "(value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2)", we use scatter_sum to avoid OOM.
-        out = (out + value_centers) / (mask.sum(dim=-1, keepdim=True) + 1.0)
+        for _ in range(self.iters):
+            b, c, ww, hh = centers.shape
+            #print(centers.shape)
+            sim = pairwise_cos_sim( centers.reshape(b, c, -1).permute(0, 2, 1), x.reshape(b, c, -1).permute(0, 2, 1) )  # [B,M,N]
+            sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
+            mask = torch.zeros_like(sim)  # binary #[B,M,N]
+            mask.scatter_(1, sim_max_idx, 1.)
+            #print(mask.shape)
+            #print(M,N)
+            sim_max_idx = rearrange(sim_max_idx.squeeze(1), 'b n -> (b n)')
+            idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, N).flatten()
+            sim_max_idx = sim_max_idx + idx_offset
+            out = rearrange(scatter_sum(value2, sim_max_idx, dim=0, dim_size=b*M), '(b m) c -> b m c', b=b, m=M)  # Different from CoC's implementation "(value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2)", we use scatter_sum to avoid OOM.
+            out = (out + value_centers) / (mask.sum(dim=-1, keepdim=True) + 1.0)
+            centers = rearrange(out, 'b (w h) c -> b c w h', w=ww, h=hh)
+            #print(centers.shape)
 
-        out = rearrange(out, 'b (w h) c -> b c w h', w=ww, h=hh)
+
         if self.fold_w > 1 and self.fold_h > 1:
             # recover the splited regions back to big feature maps if use the region partition.
-            out = rearrange(out, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
+            centers = rearrange(centers, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
 
-        out = identity + self.norm2(out)
+        #print(centers.shape)
+
+        out = identity + self.norm2(centers)
         
         return out
 
@@ -189,7 +191,7 @@ class Cluster(nn.Module):
         self.centers_proposal = nn.AdaptiveAvgPool2d((proposal_w, proposal_h))
         self.fold_w = fold_w
         self.fold_h = fold_h
-
+        self.iters = 3
     def forward(self, x):  # [b,c,w,h]
         value = self.v(x)
         x = self.f(x)
@@ -197,46 +199,46 @@ class Cluster(nn.Module):
         value = rearrange(value, "b (e c) w h -> (b e) c w h", e=self.heads)
         if self.fold_w > 1 and self.fold_h > 1:
             # split the big feature maps to small local regions to reduce computations.
+            # only for tasks with very high resolution, e.g., detection
             b0, c0, w0, h0 = x.shape
             assert w0 % self.fold_w == 0 and h0 % self.fold_h == 0, \
                 f"Ensure the feature map size ({w0}*{h0}) can be divided by fold {self.fold_w}*{self.fold_h}"
             x = rearrange(x, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w,
                           f2=self.fold_h)  # [bs*blocks,c,ks[0],ks[1]]
             value = rearrange(value, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w, f2=self.fold_h)
+        
         b, c, w, h = x.shape
         centers = self.centers_proposal(x)  # [b,c,C_W,C_H], we set M = C_W*C_H and N = w*h
         value_centers = rearrange(self.centers_proposal(value), 'b c w h -> b (w h) c')  # [b,C_W,C_H,c]
-        b, c, ww, hh = centers.shape
-        sim = torch.sigmoid(
-            self.sim_beta +
-            self.sim_alpha * pairwise_cos_sim(
-                centers.reshape(b, c, -1).permute(0, 2, 1),
-                x.reshape(b, c, -1).permute(0, 2, 1)
-            )
-        )  # [B,M,N]
-        # we use mask to sololy assign each point to one center
-        sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
-        mask = torch.zeros_like(sim)  # binary #[B,M,N]
-        mask.scatter_(1, sim_max_idx, 1.)
-        sim = sim * mask
         value2 = rearrange(value, 'b c w h -> b (w h) c')  # [B,N,D]
-        # aggregate step, out shape [B,M,D]
-        M, N = value_centers.shape[1], value2.shape[1]
+        
+        M, N = centers.shape[2]*centers.shape[3], value2.shape[1]
         value2 = rearrange(value2, 'b n c -> (b n) c')
-        sim_max_idx = rearrange(sim_max_idx.squeeze(1), 'b n -> (b n)')
-        idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, N).flatten()
-        sim_max_idx = sim_max_idx + idx_offset
-        out = rearrange(scatter_sum(value2, sim_max_idx, dim=0, dim_size=b*M), '(b m) c -> b m c', b=b, m=M)  # Different from CoC's implementation "(value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2)", we use scatter_sum to avoid OOM.
-        out = (out + value_centers) / (mask.sum(dim=-1, keepdim=True) + 1.0)
+        for _ in range(self.iters):
+            b, c, ww, hh = centers.shape
+            #print(centers.shape)
+            sim = pairwise_cos_sim( centers.reshape(b, c, -1).permute(0, 2, 1), x.reshape(b, c, -1).permute(0, 2, 1) )  # [B,M,N]
+            sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
+            mask = torch.zeros_like(sim)  # binary #[B,M,N]
+            mask.scatter_(1, sim_max_idx, 1.)
+            sim_max_idx = rearrange(sim_max_idx.squeeze(1), 'b n -> (b n)')
+            idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, N).flatten()
+            sim_max_idx = sim_max_idx + idx_offset
+            out = rearrange(scatter_sum(value2, sim_max_idx, dim=0, dim_size=b*M), '(b m) c -> b m c', b=b, m=M)  # Different from CoC's implementation "(value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2)", we use scatter_sum to avoid OOM.
+            out = (out + value_centers) / (mask.sum(dim=-1, keepdim=True) + 1.0)
+            centers = rearrange(out, 'b (w h) c -> b c w h', w=ww, h=hh)
 
+
+
+        centers = rearrange(centers, 'b c w h -> b (w h) c', w=ww, h=hh)
         # dispatch step, return to each point in a cluster
-        out = (out.unsqueeze(dim=2) * sim.unsqueeze(dim=-1)).sum(dim=1)  # [B,N,D]
+        out = (centers.unsqueeze(dim=2) * sim.unsqueeze(dim=-1)).sum(dim=1)  # [B,N,D]
         out = rearrange(out, "b (w h) c -> b c w h", w=w)
-
         if self.fold_w > 1 and self.fold_h > 1:
             # recover the splited regions back to big feature maps if use the region partition.
             out = rearrange(out, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
         out = rearrange(out, "(b e) c w h -> b (e c) w h", e=self.heads)
+
         out = self.proj(out)
         return out
 
@@ -292,13 +294,13 @@ class ClusterBlock(nn.Module):
                  act_layer=nn.GELU, norm_layer=GroupNorm,
                  drop=0., drop_path=0.,
                  use_layer_scale=True, layer_scale_init_value=1e-5,
-                 proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24, agent_num=49):
+                 proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24):
 
         super().__init__()
 
         self.norm1 = norm_layer(dim)
         self.token_mixer = Cluster(dim=dim, out_dim=dim, proposal_w=proposal_w, proposal_h=proposal_h,
-                                   fold_w=fold_w, fold_h=fold_h, heads=heads, head_dim=head_dim, agent_num=agent_num)
+                                   fold_w=fold_w, fold_h=fold_h, heads=heads, head_dim=head_dim)
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim,
@@ -330,7 +332,7 @@ def basic_blocks(dim, index, layers,
                  act_layer=nn.GELU, norm_layer=GroupNorm,
                  drop_rate=.0, drop_path_rate=0.,
                  use_layer_scale=True, layer_scale_init_value=1e-5,
-                 proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24, agent_num=49):
+                 proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24):
     blocks = []
     for block_idx in range(layers[index]):
         block_dpr = drop_path_rate * ( block_idx + sum(layers[:index])) / (sum(layers) - 1)
@@ -341,7 +343,7 @@ def basic_blocks(dim, index, layers,
             use_layer_scale=use_layer_scale,
             layer_scale_init_value=layer_scale_init_value,
             proposal_w=proposal_w, proposal_h=proposal_h, fold_w=fold_w, fold_h=fold_h,
-            heads=heads, head_dim=head_dim, agent_num=agent_num
+            heads=heads, head_dim=head_dim
         ))
     blocks = nn.Sequential(*blocks)
 
@@ -377,7 +379,7 @@ class FEC(nn.Module):
                  init_cfg=None,
                  pretrained=None,
                  proposal_w=[2, 2, 2, 2], proposal_h=[2, 2, 2, 2], fold_w=[8, 4, 2, 1], fold_h=[8, 4, 2, 1],
-                 heads=[2, 4, 6, 8], head_dim=[16, 16, 32, 32], agent_num=[49, 49, 49, 49], **kwargs):
+                 heads=[2, 4, 6, 8], head_dim=[16, 16, 32, 32],  **kwargs):
 
         super().__init__()
 
@@ -402,14 +404,14 @@ class FEC(nn.Module):
                                  layer_scale_init_value=layer_scale_init_value,
                                  proposal_w=proposal_w[i], proposal_h=proposal_h[i],
                                  fold_w=fold_w[i], fold_h=fold_h[i], heads=heads[i], head_dim=head_dim[i],
-                                 agent_num=agent_num[i]
+                        
                                  )
             network.append(stage)
             if i >= len(layers) - 1:
                 break
             if downsamples[i] or embed_dims[i] != embed_dims[i + 1]:
                 # downsampling between two stages
-                network.append( ClusterPool(down_stride, embed_dims[i], embed_dims[i + 1], fold_w=fold_w[i+1], fold_h=fold_h[i+1], agent_num=agent_num[i+1]) )
+                network.append( ClusterPool(down_stride, embed_dims[i], embed_dims[i + 1], fold_w=fold_w[i+1], fold_h=fold_h[i+1]) )
 
         self.network = nn.ModuleList(network)
 
@@ -553,13 +555,12 @@ def fec_small(pretrained=False, **kwargs):
     head_dim = [24, 24, 24, 24]
     down_patch_size = 3
     down_pad = 1
-    agent_num=[49, 49, 25, 25]
     model = FEC(
         layers, embed_dims=embed_dims, norm_layer=norm_layer,
         mlp_ratios=mlp_ratios, downsamples=downsamples,
         down_patch_size=down_patch_size, down_pad=down_pad,
         proposal_w=proposal_w, proposal_h=proposal_h, fold_w=fold_w, fold_h=fold_h,
-        heads=heads, head_dim=head_dim, agent_num=agent_num, **kwargs)
+        heads=heads, head_dim=head_dim,  **kwargs)
     model.default_cfg = default_cfgs['model_small']
     return model
 
@@ -656,13 +657,12 @@ if has_mmdet:
                 head_dim = [32, 32, 32, 32]
                 down_patch_size = 3
                 down_pad = 1
-                agent_num=[49, 49, 49, 49]
                 super().__init__(
                     layers, embed_dims=embed_dims, norm_layer=norm_layer,
                     mlp_ratios=mlp_ratios, downsamples=downsamples,
                     down_patch_size = down_patch_size, down_pad=down_pad,
                     proposal_w=proposal_w, proposal_h=proposal_h, fold_w=fold_w, fold_h=fold_h,
-                    heads=heads, head_dim=head_dim, agent_num=agent_num, fork_feat=True, **kwargs)
+                    heads=heads, head_dim=head_dim, fork_feat=True, **kwargs)
     
     @seg_BACKBONES.register_module()
     @det_BACKBONES.register_module()
