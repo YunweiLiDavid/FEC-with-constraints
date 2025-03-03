@@ -214,8 +214,8 @@ class Cluster(nn.Module):
         
         M, N = centers.shape[2]*centers.shape[3], value2.shape[1]
         value2 = rearrange(value2, 'b n c -> (b n) c')
+        b, c, ww, hh = centers.shape
         for _ in range(self.iters):
-            b, c, ww, hh = centers.shape
             #print(centers.shape)
             sim = pairwise_cos_sim( centers.reshape(b, c, -1).permute(0, 2, 1), x.reshape(b, c, -1).permute(0, 2, 1) )  # [B,M,N]
             sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
