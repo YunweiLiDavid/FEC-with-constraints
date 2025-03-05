@@ -107,16 +107,15 @@ class ClusterPool(nn.Module):
         
         b, c, w, h = x.shape
         centers = F.adaptive_avg_pool2d(x, (w // self.stride, h // self.stride))
-
+        b, c, ww, hh = centers.shape
 
         ''''''
         value_centers = rearrange(F.adaptive_avg_pool2d(value, (w // self.stride, h // self.stride)), 'b c w h -> b (w h) c')
         value2 = rearrange(value, 'b c w h -> b (w h) c')  # [B,N,D]
         
-        M, N = centers.shape[2]*centers.shape[3], value2.shape[1]
+        M, N = value_centers.shape[1], value2.shape[1]
         value2 = rearrange(value2, 'b n c -> (b n) c')
         for _ in range(self.iters):
-            b, c, ww, hh = centers.shape
             #print(centers.shape)
             sim = pairwise_cos_sim( centers.reshape(b, c, -1).permute(0, 2, 1), x.reshape(b, c, -1).permute(0, 2, 1) )  # [B,M,N]
             sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
@@ -142,6 +141,7 @@ class ClusterPool(nn.Module):
         out = identity + self.norm2(centers)
         
         return out
+
 
 
 class GroupNorm(nn.GroupNorm):
@@ -212,12 +212,18 @@ class Cluster(nn.Module):
         value_centers = rearrange(self.centers_proposal(value), 'b c w h -> b (w h) c')  # [b,C_W,C_H,c]
         value2 = rearrange(value, 'b c w h -> b (w h) c')  # [B,N,D]
         
-        M, N = centers.shape[2]*centers.shape[3], value2.shape[1]
+        M, N = value_centers.shape[1], value2.shape[1]
         value2 = rearrange(value2, 'b n c -> (b n) c')
         b, c, ww, hh = centers.shape
         for _ in range(self.iters):
             #print(centers.shape)
-            sim = pairwise_cos_sim( centers.reshape(b, c, -1).permute(0, 2, 1), x.reshape(b, c, -1).permute(0, 2, 1) )  # [B,M,N]
+            sim = torch.sigmoid(
+            self.sim_beta +
+            self.sim_alpha * pairwise_cos_sim(
+                centers.reshape(b, c, -1).permute(0, 2, 1),
+                x.reshape(b, c, -1).permute(0, 2, 1)
+            )
+        )  # [B,M,N]
             sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
             mask = torch.zeros_like(sim)  # binary #[B,M,N]
             mask.scatter_(1, sim_max_idx, 1.)
@@ -229,7 +235,7 @@ class Cluster(nn.Module):
             centers = rearrange(out, 'b (w h) c -> b c w h', w=ww, h=hh)
 
 
-
+        sim = sim * mask
         centers = rearrange(centers, 'b c w h -> b (w h) c', w=ww, h=hh)
         # dispatch step, return to each point in a cluster
         out = (centers.unsqueeze(dim=2) * sim.unsqueeze(dim=-1)).sum(dim=1)  # [B,N,D]
