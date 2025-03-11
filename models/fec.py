@@ -13,7 +13,7 @@ from timm.layers.helpers import to_2tuple
 from einops import rearrange
 import torch.nn.functional as F
 from torch_scatter import scatter_sum
-
+from flash_attn import flash_attn_func 
 try:
     from mmseg.models.builder import BACKBONES as seg_BACKBONES
     from mmseg.utils import get_root_logger
@@ -147,7 +147,8 @@ class ClusterPool(nn.Module):
         self.conv_skip = nn.Conv2d(in_chans, embed_dim, kernel_size=3, padding=1, stride=2)  # for skip connection
         self.fold_w = fold_w
         self.fold_h = fold_h
-        self.iters = 3
+        self.iter = 3
+
     def forward(self, x):
         identity = self.conv_skip(x)
         value = self.conv_v(x)
@@ -164,38 +165,47 @@ class ClusterPool(nn.Module):
         
         b, c, w, h = x.shape
         centers = F.adaptive_avg_pool2d(x, (w // self.stride, h // self.stride))
-        b, c, ww, hh = centers.shape
-
-        ''''''
         value_centers = rearrange(F.adaptive_avg_pool2d(value, (w // self.stride, h // self.stride)), 'b c w h -> b (w h) c')
         value2 = rearrange(value, 'b c w h -> b (w h) c')  # [B,N,D]
-        
+        b, c, ww, hh = centers.shape
         M, N = value_centers.shape[1], value2.shape[1]
-        value2 = rearrange(value2, 'b n c -> (b n) c')
-        for _ in range(self.iters):
-            #print(centers.shape)
-            sim = pairwise_cos_sim( centers.reshape(b, c, -1).permute(0, 2, 1), x.reshape(b, c, -1).permute(0, 2, 1) )  # [B,M,N]
-            sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
-            mask = torch.zeros_like(sim)  # binary #[B,M,N]
-            mask.scatter_(1, sim_max_idx, 1.)
-            #print(mask.shape)
-            #print(M,N)
-            sim_max_idx = rearrange(sim_max_idx.squeeze(1), 'b n -> (b n)')
-            idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, N).flatten()
-            sim_max_idx = sim_max_idx + idx_offset
-            out = rearrange(scatter_sum(value2, sim_max_idx, dim=0, dim_size=b*M), '(b m) c -> b m c', b=b, m=M)  # Different from CoC's implementation "(value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2)", we use scatter_sum to avoid OOM.
-            out = (out + value_centers) / (mask.sum(dim=-1, keepdim=True) + 1.0)
-            centers = rearrange(out, 'b (w h) c -> b c w h', w=ww, h=hh)
-            #print(centers.shape)
+
+        # processing before flash attention
+        centers = centers.reshape(b, M, 1, c).type(torch.half)
+        value2 = value2.reshape(b, N, 1, c).type(torch.half)
+        x = x.reshape(b, N, 1, c).type(torch.half)
+        
+        for _ in range(self.iter):    # iterative clustering and updating centers
+            centers = flash_attn_func(centers, value2, x)
 
 
+        # processing after flash attention
+        centers = centers.reshape(b, c, ww, hh).type(torch.float)
+        value2 = value2.reshape(b, w*h, c).type(torch.float)
+        x = x.reshape(b, w*h, c).type(torch.float) 
+
+
+
+        sim = pairwise_cos_sim( centers.reshape(b, c, -1).permute(0, 2, 1), x.reshape(b, c, -1).permute(0, 2, 1) )  # [B,M,N]
+        # we use mask to sololy assign each point to one center
+        sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
+        mask = torch.zeros_like(sim)  # binary #[B,M,N]
+        mask.scatter_(1, sim_max_idx, 1.)
+        
+        # aggregate step, out shape [B,M,D]
+
+        sim_max_idx = rearrange(sim_max_idx.squeeze(1), 'b n -> (b n)')
+        idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, N).flatten()
+        sim_max_idx = sim_max_idx + idx_offset
+        out = rearrange(scatter_sum(value2, sim_max_idx, dim=0, dim_size=b*M), '(b m) c -> b m c', b=b, m=M)  # Different from CoC's implementation "(value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2)", we use scatter_sum to avoid OOM.
+        out = (out + value_centers) / (mask.sum(dim=-1, keepdim=True) + 1.0)
+
+        out = rearrange(out, 'b (w h) c -> b c w h', w=ww, h=hh)
         if self.fold_w > 1 and self.fold_h > 1:
             # recover the splited regions back to big feature maps if use the region partition.
-            centers = rearrange(centers, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
+            out = rearrange(out, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
 
-        #print(centers.shape)
-
-        out = identity + self.norm2(centers)
+        out = identity + self.norm2(out)
         
         return out
 
@@ -329,7 +339,7 @@ class Cluster(nn.Module):
         self.centers_proposal = nn.AdaptiveAvgPool2d((proposal_w, proposal_h))
         self.fold_w = fold_w
         self.fold_h = fold_h
-        self.iters = 3
+        self.iters = 5
     def forward(self, x):  # [b,c,w,h]
         value = self.v(x)
         x = self.f(x)
