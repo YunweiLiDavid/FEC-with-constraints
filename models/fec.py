@@ -147,7 +147,7 @@ class ClusterPool(nn.Module):
         self.conv_skip = nn.Conv2d(in_chans, embed_dim, kernel_size=3, padding=1, stride=2)  # for skip connection
         self.fold_w = fold_w
         self.fold_h = fold_h
-        self.iters = 3
+        self.iters = 5
     def forward(self, x):
         identity = self.conv_skip(x)
         value = self.conv_v(x)
@@ -248,7 +248,7 @@ class Cluster(nn.Module):
         self.centers_proposal = nn.AdaptiveAvgPool2d((proposal_w, proposal_h))
         self.fold_w = fold_w
         self.fold_h = fold_h
-        self.iters = 3
+        self.iters = 5
     def forward(self, x):  # [b,c,w,h]
         value = self.v(x)
         x = self.f(x)
