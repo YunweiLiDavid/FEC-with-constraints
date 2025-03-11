@@ -349,7 +349,7 @@ class Cluster(nn.Module):
         centers = self.centers_proposal(x)  # [b,c,C_W,C_H], we set M = C_W*C_H and N = w*h
         value_centers = rearrange(self.centers_proposal(value), 'b c w h -> b (w h) c')  # [b,C_W,C_H,c]
         value2 = rearrange(value, 'b c w h -> b (w h) c')  # [B,N,D]
-        
+
 
         M, N = value_centers.shape[1], value2.shape[1]
         value2 = rearrange(value2, 'b n c -> (b n) c')
