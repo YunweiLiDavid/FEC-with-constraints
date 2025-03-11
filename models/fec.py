@@ -171,9 +171,9 @@ class ClusterPool(nn.Module):
         M, N = value_centers.shape[1], value2.shape[1]
         print(M,N,b,c,ww,hh)
         # processing before flash attention
-        centers = centers.reshape(b, M, 1, c).type(torch.half)
-        value2 = value2.reshape(b, N, 1, c).type(torch.half)
-        x = x.reshape(b, N, 1, c).type(torch.half)
+        centers = centers.reshape(b, M, 4, c//4).type(torch.half)
+        value2 = value2.reshape(b, N, 4, c//4).type(torch.half)
+        x = x.reshape(b, N, 4, c//4).type(torch.half)
 
 
 
@@ -226,8 +226,10 @@ class ClusterPool(nn.Module):
 
 
         out = identity + self.norm2(out)
-        
-        return out.to("cpu")
+        out = out.to("cpu")
+
+        print(f"out device: {out.device}")
+        return out
 
 
 
