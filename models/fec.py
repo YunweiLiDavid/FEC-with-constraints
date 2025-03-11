@@ -140,7 +140,7 @@ class ClusterPool(nn.Module):
 
     def __init__(self, stride=4, in_chans=5, embed_dim=64, norm_layer=None, fold_w=1, fold_h=1):
         super().__init__()
-        self.norm2 = GroupNorm(embed_dim)
+        self.norm2 = GroupNorm(embed_dim).to("cuda")
         self.stride = stride
         self.conv_f = nn.Conv2d(in_chans, embed_dim, kernel_size=1)  # for similarity
         self.conv_v = nn.Conv2d(in_chans, embed_dim, kernel_size=1)  # for value
@@ -150,9 +150,9 @@ class ClusterPool(nn.Module):
         self.iter = 3
 
     def forward(self, x):
-        identity = self.conv_skip(x)
-        value = self.conv_v(x)
-        x = self.conv_f(x)
+        identity = self.conv_skip(x).to("cuda")
+        value = self.conv_v(x).to("cuda")
+        x = self.conv_f(x).to("cuda")
         if self.fold_w > 1 and self.fold_h > 1:
             # split the big feature maps to small local regions to reduce computations.
             # only for tasks with very high resolution, e.g., detection
@@ -169,12 +169,19 @@ class ClusterPool(nn.Module):
         value2 = rearrange(value, 'b c w h -> b (w h) c')  # [B,N,D]
         b, c, ww, hh = centers.shape
         M, N = value_centers.shape[1], value2.shape[1]
-
+        print(M,N,b,c,ww,hh)
         # processing before flash attention
         centers = centers.reshape(b, M, 1, c).type(torch.half)
         value2 = value2.reshape(b, N, 1, c).type(torch.half)
         x = x.reshape(b, N, 1, c).type(torch.half)
-        
+
+
+
+        print(f"centers shape: {centers.shape}")  # 形状：[batch, num_heads, seq_len, head_dim]
+        print(f"value2 shape: {value2.shape}")
+        print(f"x shape: {x.shape}")
+            
+
         for _ in range(self.iter):    # iterative clustering and updating centers
             centers = flash_attn_func(centers, value2, x)
 
@@ -183,7 +190,7 @@ class ClusterPool(nn.Module):
         centers = centers.reshape(b, c, ww, hh).type(torch.float)
         value2 = value2.reshape(b, w*h, c).type(torch.float)
         x = x.reshape(b, w*h, c).type(torch.float) 
-
+        print(centers.shape)
 
 
         sim = pairwise_cos_sim( centers.reshape(b, c, -1).permute(0, 2, 1), x.reshape(b, c, -1).permute(0, 2, 1) )  # [B,M,N]
@@ -193,11 +200,20 @@ class ClusterPool(nn.Module):
         mask.scatter_(1, sim_max_idx, 1.)
         
         # aggregate step, out shape [B,M,D]
-
+        value2 = rearrange(value2, 'b n c -> (b n) c')
         sim_max_idx = rearrange(sim_max_idx.squeeze(1), 'b n -> (b n)')
         idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, N).flatten()
         sim_max_idx = sim_max_idx + idx_offset
+
+
+
+
         out = rearrange(scatter_sum(value2, sim_max_idx, dim=0, dim_size=b*M), '(b m) c -> b m c', b=b, m=M)  # Different from CoC's implementation "(value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2)", we use scatter_sum to avoid OOM.
+        
+        print(f"out device: {out.device}")
+
+        
+        
         out = (out + value_centers) / (mask.sum(dim=-1, keepdim=True) + 1.0)
 
         out = rearrange(out, 'b (w h) c -> b c w h', w=ww, h=hh)
@@ -205,9 +221,13 @@ class ClusterPool(nn.Module):
             # recover the splited regions back to big feature maps if use the region partition.
             out = rearrange(out, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
 
+
+
+
+
         out = identity + self.norm2(out)
         
-        return out
+        return out.to("cpu")
 
 
 
