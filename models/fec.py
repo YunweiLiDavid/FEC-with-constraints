@@ -140,7 +140,7 @@ class ClusterPool(nn.Module):
 
     def __init__(self, stride=4, in_chans=5, embed_dim=64, norm_layer=None, fold_w=1, fold_h=1):
         super().__init__()
-        self.norm2 = GroupNorm(embed_dim).to("cuda")
+        self.norm2 = GroupNorm(embed_dim)
         self.stride = stride
         self.conv_f = nn.Conv2d(in_chans, embed_dim, kernel_size=1)  # for similarity
         self.conv_v = nn.Conv2d(in_chans, embed_dim, kernel_size=1)  # for value
@@ -150,9 +150,9 @@ class ClusterPool(nn.Module):
         self.iter = 3
 
     def forward(self, x):
-        identity = self.conv_skip(x).to("cuda")
-        value = self.conv_v(x).to("cuda")
-        x = self.conv_f(x).to("cuda")
+        identity = self.conv_skip(x)
+        value = self.conv_v(x)
+        x = self.conv_f(x)
         if self.fold_w > 1 and self.fold_h > 1:
             # split the big feature maps to small local regions to reduce computations.
             # only for tasks with very high resolution, e.g., detection
@@ -169,29 +169,25 @@ class ClusterPool(nn.Module):
         value2 = rearrange(value, 'b c w h -> b (w h) c')  # [B,N,D]
         b, c, ww, hh = centers.shape
         M, N = value_centers.shape[1], value2.shape[1]
-        print(M,N,b,c,ww,hh)
+        #print(M,N,b,c,ww,hh)
         # processing before flash attention
-        centers = centers.reshape(b, M, 4, c//4).type(torch.half)
-        value2 = value2.reshape(b, N, 4, c//4).type(torch.half)
-        x = x.reshape(b, N, 4, c//4).type(torch.half)
+        centers = centers.reshape(b, M, c)
+        value2 = value2.reshape(b, N, c)
+        x = x.reshape(b, N, c)
 
 
-
+        '''
         print(f"centers shape: {centers.shape}")  # 形状：[batch, num_heads, seq_len, head_dim]
         print(f"value2 shape: {value2.shape}")
         print(f"x shape: {x.shape}")
-            
+        '''
 
         for _ in range(self.iter):    # iterative clustering and updating centers
-            centers = flash_attn_func(centers, value2, x)
+            centers = scaled_dot_product_attention(centers, x, value2)
 
 
-        # processing after flash attention
-        centers = centers.reshape(b, c, ww, hh).type(torch.float)
-        value2 = value2.reshape(b, w*h, c).type(torch.float)
-        x = x.reshape(b, w*h, c).type(torch.float) 
-        print(centers.shape)
-
+        # processing after attention
+        centers = centers.reshape(b, c, ww, hh)
 
         sim = pairwise_cos_sim( centers.reshape(b, c, -1).permute(0, 2, 1), x.reshape(b, c, -1).permute(0, 2, 1) )  # [B,M,N]
         # we use mask to sololy assign each point to one center
@@ -210,7 +206,6 @@ class ClusterPool(nn.Module):
 
         out = rearrange(scatter_sum(value2, sim_max_idx, dim=0, dim_size=b*M), '(b m) c -> b m c', b=b, m=M)  # Different from CoC's implementation "(value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2)", we use scatter_sum to avoid OOM.
         
-        print(f"out device: {out.device}")
 
         
         
@@ -226,12 +221,26 @@ class ClusterPool(nn.Module):
 
 
         out = identity + self.norm2(out)
-        out = out.to("cpu")
+        out = out
 
-        print(f"out device: {out.device}")
         return out
 
+def scaled_dot_product_attention(Q, K, V):
+    """
+    实现论文中的 Recurrent Cross-Attention
+    Q: (batch, K, D) - 查询 (从中心 C 投影)
+    K: (batch, HW, D) - 键 (从图像特征 I 投影)
+    V: (batch, HW, D) - 值 (从图像特征 I 投影)
+    """
+    
+    # 计算 M_hat = softmax(Q @ K^T)
+    attn_weights = torch.matmul(Q, K.transpose(-2, -1))  # (batch, K, HW)
+    attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)  # softmax over HW
 
+    # 计算 C = M_hat @ V
+    C = torch.matmul(attn_weights, V)  # (batch, K, D)
+    
+    return C
 
 class GroupNorm(nn.GroupNorm):
     """
@@ -256,7 +265,8 @@ def pairwise_cos_sim(x1: torch.Tensor, x2: torch.Tensor):
     sim = torch.matmul(x1, x2.transpose(-2, -1))
     return sim
 
-'''
+
+
 class Cluster(nn.Module):
     def __init__(self, dim, out_dim, proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24):
         """
@@ -281,87 +291,6 @@ class Cluster(nn.Module):
         self.fold_w = fold_w
         self.fold_h = fold_h
         self.iters = 3
-    def forward(self, x):  # [b,c,w,h]
-        value = self.v(x)
-        x = self.f(x)
-        x = rearrange(x, "b (e c) w h -> (b e) c w h", e=self.heads)
-        value = rearrange(value, "b (e c) w h -> (b e) c w h", e=self.heads)
-        if self.fold_w > 1 and self.fold_h > 1:
-            # split the big feature maps to small local regions to reduce computations.
-            # only for tasks with very high resolution, e.g., detection
-            b0, c0, w0, h0 = x.shape
-            assert w0 % self.fold_w == 0 and h0 % self.fold_h == 0, \
-                f"Ensure the feature map size ({w0}*{h0}) can be divided by fold {self.fold_w}*{self.fold_h}"
-            x = rearrange(x, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w,
-                          f2=self.fold_h)  # [bs*blocks,c,ks[0],ks[1]]
-            value = rearrange(value, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w, f2=self.fold_h)
-        
-        b, c, w, h = x.shape
-        centers = self.centers_proposal(x)  # [b,c,C_W,C_H], we set M = C_W*C_H and N = w*h
-        value_centers = rearrange(self.centers_proposal(value), 'b c w h -> b (w h) c')  # [b,C_W,C_H,c]
-        value2 = rearrange(value, 'b c w h -> b (w h) c')  # [B,N,D]
-        
-        M, N = value_centers.shape[1], value2.shape[1]
-        value2 = rearrange(value2, 'b n c -> (b n) c')
-        b, c, ww, hh = centers.shape
-        for _ in range(self.iters):
-            #print(centers.shape)
-            sim = torch.sigmoid(
-            self.sim_beta +
-            self.sim_alpha * pairwise_cos_sim(
-                centers.reshape(b, c, -1).permute(0, 2, 1),
-                x.reshape(b, c, -1).permute(0, 2, 1)
-            )
-        )  # [B,M,N]
-            sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
-            mask = torch.zeros_like(sim)  # binary #[B,M,N]
-            mask.scatter_(1, sim_max_idx, 1.)
-            sim_max_idx = rearrange(sim_max_idx.squeeze(1), 'b n -> (b n)')
-            idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, N).flatten()
-            sim_max_idx = sim_max_idx + idx_offset
-            out = rearrange(scatter_sum(value2, sim_max_idx, dim=0, dim_size=b*M), '(b m) c -> b m c', b=b, m=M)  # Different from CoC's implementation "(value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2)", we use scatter_sum to avoid OOM.
-            out = (out + value_centers) / (mask.sum(dim=-1, keepdim=True) + 1.0)
-
-            sim = sim * mask
-            # dispatch step, return to each point in a cluster
-            out = (out.unsqueeze(dim=2) * sim.unsqueeze(dim=-1)).sum(dim=1)  # [B,N,D]
-            out = rearrange(out, "b (w h) c -> b c w h", w=w)
-            centers = self.centers_proposal(out)
-
-
-        if self.fold_w > 1 and self.fold_h > 1:
-            # recover the splited regions back to big feature maps if use the region partition.
-            out = rearrange(out, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
-        out = rearrange(out, "(b e) c w h -> b (e c) w h", e=self.heads)
-
-        out = self.proj(out)
-        return out
-'''
-
-class Cluster(nn.Module):
-    def __init__(self, dim, out_dim, proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24):
-        """
-        :param dim:  channel nubmer
-        :param out_dim: channel nubmer
-        :param proposal_w: the sqrt(proposals) value, we can also set a different value
-        :param proposal_h: the sqrt(proposals) value, we can also set a different value
-        :param fold_w: the sqrt(number of regions) value, we can also set a different value
-        :param fold_h: the sqrt(number of regions) value, we can also set a different value
-        :param heads:  heads number in context cluster
-        :param head_dim: dimension of each head in context cluster
-        """
-        super().__init__()
-        self.heads = heads
-        self.head_dim = head_dim
-        self.f = nn.Conv2d(dim, heads * head_dim, kernel_size=1)  # for similarity
-        self.proj = nn.Conv2d(heads * head_dim, out_dim, kernel_size=1)  # for projecting channel number
-        self.v = nn.Conv2d(dim, heads * head_dim, kernel_size=1)  # for value
-        self.sim_alpha = nn.Parameter(torch.ones(1))
-        self.sim_beta = nn.Parameter(torch.zeros(1))
-        self.centers_proposal = nn.AdaptiveAvgPool2d((proposal_w, proposal_h))
-        self.fold_w = fold_w
-        self.fold_h = fold_h
-        self.iters = 5
     def forward(self, x):  # [b,c,w,h]
         value = self.v(x)
         x = self.f(x)
