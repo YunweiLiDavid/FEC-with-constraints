@@ -186,10 +186,9 @@ class ClusterPool(nn.Module):
             centers = scaled_dot_product_attention(centers, x, value2)
 
 
-        # processing after attention
-        centers = centers.reshape(b, c, ww, hh)
 
-        sim = pairwise_cos_sim( centers.reshape(b, c, -1).permute(0, 2, 1), x.reshape(b, c, -1).permute(0, 2, 1) )  # [B,M,N]
+
+        sim = pairwise_cos_sim( centers, x )  # [B,M,N]
         # we use mask to sololy assign each point to one center
         sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
         mask = torch.zeros_like(sim)  # binary #[B,M,N]
@@ -313,26 +312,38 @@ class Cluster(nn.Module):
         
 
         M, N = value_centers.shape[1], value2.shape[1]
-        value2 = rearrange(value2, 'b n c -> (b n) c')
+        
         b, c, ww, hh = centers.shape
-        for _ in range(self.iters):
-            #print(centers.shape)
-            sim = torch.sigmoid(
+
+        centers = centers.reshape(b, M, c)
+        x = x.reshape(b, N, c)
+
+        for _ in range(self.iter):    # iterative clustering and updating centers
+            centers = scaled_dot_product_attention(centers, x, value2)
+
+
+
+        # processing after attention
+        centers = centers.reshape(b, c, ww, hh)
+        value2 = rearrange(value2, 'b n c -> (b n) c')
+
+
+        sim = torch.sigmoid(
             self.sim_beta +
             self.sim_alpha * pairwise_cos_sim(
                 centers.reshape(b, c, -1).permute(0, 2, 1),
                 x.reshape(b, c, -1).permute(0, 2, 1)
             )
         )  # [B,M,N]
-            sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
-            mask = torch.zeros_like(sim)  # binary #[B,M,N]
-            mask.scatter_(1, sim_max_idx, 1.)
-            sim_max_idx = rearrange(sim_max_idx.squeeze(1), 'b n -> (b n)')
-            idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, N).flatten()
-            sim_max_idx = sim_max_idx + idx_offset
-            out = rearrange(scatter_sum(value2, sim_max_idx, dim=0, dim_size=b*M), '(b m) c -> b m c', b=b, m=M)  # Different from CoC's implementation "(value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2)", we use scatter_sum to avoid OOM.
-            out = (out + value_centers) / (mask.sum(dim=-1, keepdim=True) + 1.0)
-            centers = rearrange(out, 'b (w h) c -> b c w h', w=ww, h=hh)
+        sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
+        mask = torch.zeros_like(sim)  # binary #[B,M,N]
+        mask.scatter_(1, sim_max_idx, 1.)            
+        sim_max_idx = rearrange(sim_max_idx.squeeze(1), 'b n -> (b n)')
+        idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, N).flatten()
+        sim_max_idx = sim_max_idx + idx_offset
+        out = rearrange(scatter_sum(value2, sim_max_idx, dim=0, dim_size=b*M), '(b m) c -> b m c', b=b, m=M)  # Different from CoC's implementation "(value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2)", we use scatter_sum to avoid OOM.
+        out = (out + value_centers) / (mask.sum(dim=-1, keepdim=True) + 1.0)
+        centers = rearrange(out, 'b (w h) c -> b c w h', w=ww, h=hh)
 
 
         sim = sim * mask
