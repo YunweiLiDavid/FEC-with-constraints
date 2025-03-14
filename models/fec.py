@@ -226,17 +226,17 @@ class ClusterPool(nn.Module):
 
 def scaled_dot_product_attention(Q, K, V):
     """
-    实现论文中的 Recurrent Cross-Attention
-    Q: (batch, K, D) - 查询 (从中心 C 投影)
-    K: (batch, HW, D) - 键 (从图像特征 I 投影)
-    V: (batch, HW, D) - 值 (从图像特征 I 投影)
+    regular attention implementation
+    Q: (batch, K, D) 
+    K: (batch, HW, D) 
+    V: (batch, HW, D) 
     """
     
-    # 计算 M_hat = softmax(Q @ K^T)
+    #  M_hat = softmax(Q @ K^T)
     attn_weights = torch.matmul(Q, K.transpose(-2, -1))  # (batch, K, HW)
     attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)  # softmax over HW
 
-    # 计算 C = M_hat @ V
+    #  C = M_hat @ V
     C = torch.matmul(attn_weights, V)  # (batch, K, D)
     
     return C
@@ -318,38 +318,41 @@ class Cluster(nn.Module):
         centers = centers.reshape(b, M, c)
         x = x.reshape(b, N, c)
 
-        for _ in range(self.iter):    # iterative clustering and updating centers
+        for _ in range(self.iters):    # iterative clustering and updating centers
             centers = scaled_dot_product_attention(centers, x, value2)
 
 
 
-        # processing after attention
-        centers = centers.reshape(b, c, ww, hh)
+        # aggregate step
+
         value2 = rearrange(value2, 'b n c -> (b n) c')
 
 
         sim = torch.sigmoid(
             self.sim_beta +
             self.sim_alpha * pairwise_cos_sim(
-                centers.reshape(b, c, -1).permute(0, 2, 1),
-                x.reshape(b, c, -1).permute(0, 2, 1)
+                centers, x
             )
         )  # [B,M,N]
+        
         sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
         mask = torch.zeros_like(sim)  # binary #[B,M,N]
-        mask.scatter_(1, sim_max_idx, 1.)            
+        mask.scatter_(1, sim_max_idx, 1.)  
+
+        sim = sim * mask
+
         sim_max_idx = rearrange(sim_max_idx.squeeze(1), 'b n -> (b n)')
         idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, N).flatten()
         sim_max_idx = sim_max_idx + idx_offset
         out = rearrange(scatter_sum(value2, sim_max_idx, dim=0, dim_size=b*M), '(b m) c -> b m c', b=b, m=M)  # Different from CoC's implementation "(value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2)", we use scatter_sum to avoid OOM.
         out = (out + value_centers) / (mask.sum(dim=-1, keepdim=True) + 1.0)
-        centers = rearrange(out, 'b (w h) c -> b c w h', w=ww, h=hh)
+      
 
 
-        sim = sim * mask
-        centers = rearrange(centers, 'b c w h -> b (w h) c', w=ww, h=hh)
+        
+  
         # dispatch step, return to each point in a cluster
-        out = (centers.unsqueeze(dim=2) * sim.unsqueeze(dim=-1)).sum(dim=1)  # [B,N,D]
+        out = (out.unsqueeze(dim=2) * sim.unsqueeze(dim=-1)).sum(dim=1)  # [B,N,D]
         out = rearrange(out, "b (w h) c -> b c w h", w=w)
         if self.fold_w > 1 and self.fold_h > 1:
             # recover the splited regions back to big feature maps if use the region partition.
@@ -358,6 +361,7 @@ class Cluster(nn.Module):
 
         out = self.proj(out)
         return out
+
 
 class Mlp(nn.Module):
     """
