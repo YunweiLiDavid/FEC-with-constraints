@@ -147,7 +147,8 @@ class ClusterPool(nn.Module):
         self.conv_skip = nn.Conv2d(in_chans, embed_dim, kernel_size=3, padding=1, stride=2)  # for skip connection
         self.fold_w = fold_w
         self.fold_h = fold_h
-        self.iters = 5
+        self.iters = 3
+        self.q = nn.Linear(embed_dim, embed_dim, bias=False)
     def forward(self, x):
         identity = self.conv_skip(x)
         value = self.conv_v(x)
@@ -185,17 +186,18 @@ class ClusterPool(nn.Module):
             sim_max_idx = sim_max_idx + idx_offset
             out = rearrange(scatter_sum(value2, sim_max_idx, dim=0, dim_size=b*M), '(b m) c -> b m c', b=b, m=M)  # Different from CoC's implementation "(value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2)", we use scatter_sum to avoid OOM.
             out = (out + value_centers) / (mask.sum(dim=-1, keepdim=True) + 1.0)
-            centers = rearrange(out, 'b (w h) c -> b c w h', w=ww, h=hh)
+            centers = self.q(out)
+            centers = rearrange(centers, 'b (w h) c -> b c w h', w=ww, h=hh)
             #print(centers.shape)
 
-
+        out = rearrange(out, 'b (w h) c -> b c w h', w=ww, h=hh)
         if self.fold_w > 1 and self.fold_h > 1:
             # recover the splited regions back to big feature maps if use the region partition.
-            centers = rearrange(centers, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
+            out = rearrange(out, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
 
         #print(centers.shape)
 
-        out = identity + self.norm2(centers)
+        out = identity + self.norm2(out)
         
         return out
 
@@ -329,7 +331,7 @@ class Cluster(nn.Module):
         self.centers_proposal = nn.AdaptiveAvgPool2d((proposal_w, proposal_h))
         self.fold_w = fold_w
         self.fold_h = fold_h
-        self.iters = 5
+        self.iters = 3
     def forward(self, x):  # [b,c,w,h]
         value = self.v(x)
         x = self.f(x)
