@@ -332,6 +332,7 @@ class Cluster(nn.Module):
         self.fold_w = fold_w
         self.fold_h = fold_h
         self.iters = 3
+        self.q = nn.Linear(embed_dim, embed_dim, bias=False)
     def forward(self, x):  # [b,c,w,h]
         value = self.v(x)
         x = self.f(x)
@@ -373,13 +374,11 @@ class Cluster(nn.Module):
             sim_max_idx = sim_max_idx + idx_offset
             out = rearrange(scatter_sum(value2, sim_max_idx, dim=0, dim_size=b*M), '(b m) c -> b m c', b=b, m=M)  # Different from CoC's implementation "(value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2)", we use scatter_sum to avoid OOM.
             out = (out + value_centers) / (mask.sum(dim=-1, keepdim=True) + 1.0)
-            centers = rearrange(out, 'b (w h) c -> b c w h', w=ww, h=hh)
-
+            centers = self.q(out)
 
         sim = sim * mask
-        centers = rearrange(centers, 'b c w h -> b (w h) c', w=ww, h=hh)
         # dispatch step, return to each point in a cluster
-        out = (centers.unsqueeze(dim=2) * sim.unsqueeze(dim=-1)).sum(dim=1)  # [B,N,D]
+        out = (out.unsqueeze(dim=2) * sim.unsqueeze(dim=-1)).sum(dim=1)  # [B,N,D]
         out = rearrange(out, "b (w h) c -> b c w h", w=w)
         if self.fold_w > 1 and self.fold_h > 1:
             # recover the splited regions back to big feature maps if use the region partition.
