@@ -148,7 +148,8 @@ class ClusterPool(nn.Module):
         self.fold_w = fold_w
         self.fold_h = fold_h
         self.iter = 3
-
+        self.softmax = nn.Softmax(dim=-2)
+        
     def forward(self, x):
         identity = self.conv_skip(x)
         value = self.conv_v(x)
@@ -183,7 +184,8 @@ class ClusterPool(nn.Module):
         '''
 
         for _ in range(self.iter):    # iterative clustering and updating centers
-            centers = scaled_dot_product_attention(centers, x, value2)
+            similarity = self.softmax((centers @ value2.transpose(-2, -1)))
+            centers = similarity @ x
 
 
 
@@ -290,6 +292,8 @@ class Cluster(nn.Module):
         self.fold_w = fold_w
         self.fold_h = fold_h
         self.iters = 3
+        self.softmax = nn.Softmax(dim=-2)
+
     def forward(self, x):  # [b,c,w,h]
         value = self.v(x)
         x = self.f(x)
@@ -319,7 +323,8 @@ class Cluster(nn.Module):
         x = x.reshape(b, N, c)
 
         for _ in range(self.iters):    # iterative clustering and updating centers
-            centers = scaled_dot_product_attention(centers, x, value2)
+            similarity = self.softmax((centers @ value2.transpose(-2, -1)))
+            centers = similarity @ x
 
 
 
