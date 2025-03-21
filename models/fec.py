@@ -380,7 +380,7 @@ class Cluster(nn.Module):
 
         out = self.proj(out)
         return out
-'''
+
 #最原始的cluster
 class Cluster(nn.Module):
     def __init__(self, dim, out_dim, proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24):
@@ -537,7 +537,7 @@ class Cluster(nn.Module):
 
         out = self.proj(out)
         return out
-'''
+
 class Mlp(nn.Module):
     """
     Implementation of MLP with nn.Linear (would be slightly faster in both training and inference).
