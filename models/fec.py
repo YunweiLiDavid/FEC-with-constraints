@@ -147,7 +147,7 @@ class ClusterPool(nn.Module):
         self.conv_skip = nn.Conv2d(in_chans, embed_dim, kernel_size=3, padding=1, stride=2)  # for skip connection
         self.fold_w = fold_w
         self.fold_h = fold_h
-        self.iter = 3
+        self.iter = 5
         self.softmax = nn.Softmax(dim=-2)
         
     def forward(self, x):
@@ -184,8 +184,8 @@ class ClusterPool(nn.Module):
         '''
 
         for _ in range(self.iter):    # iterative clustering and updating centers
-            similarity = self.softmax((centers @ value2.transpose(-2, -1)))
-            centers = similarity @ x
+            similarity = self.softmax((centers @ x.transpose(-2, -1)))
+            centers = similarity @ value2
 
 
 
@@ -291,7 +291,7 @@ class Cluster(nn.Module):
         self.centers_proposal = nn.AdaptiveAvgPool2d((proposal_w, proposal_h))
         self.fold_w = fold_w
         self.fold_h = fold_h
-        self.iters = 3
+        self.iters = 5
         self.softmax = nn.Softmax(dim=-2)
 
     def forward(self, x):  # [b,c,w,h]
@@ -323,8 +323,8 @@ class Cluster(nn.Module):
         x = x.reshape(b, N, c)
 
         for _ in range(self.iters):    # iterative clustering and updating centers
-            similarity = self.softmax((centers @ value2.transpose(-2, -1)))
-            centers = similarity @ x
+            similarity = self.softmax((centers @ x.transpose(-2, -1)))
+            centers = similarity @ value2
 
 
 
