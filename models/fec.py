@@ -13,7 +13,7 @@ from timm.layers.helpers import to_2tuple
 from einops import rearrange
 import torch.nn.functional as F
 from torch_scatter import scatter_sum
-from flash_attn import flash_attn_func 
+#from flash_attn import flash_attn_func 
 try:
     from mmseg.models.builder import BACKBONES as seg_BACKBONES
     from mmseg.utils import get_root_logger
@@ -138,7 +138,7 @@ class ClusterPool(nn.Module):
     Output: tensor in shape [B, embed_dim, H/stride, W/stride]
     """
 
-    def __init__(self, stride=4, in_chans=5, embed_dim=64, norm_layer=None, fold_w=1, fold_h=1):
+    def __init__(self, stride=4, in_chans=5, embed_dim=64, norm_layer=None, fold_w=1, fold_h=1, agent_num=16):
         super().__init__()
         self.norm2 = GroupNorm(embed_dim)
         self.stride = stride
@@ -149,7 +149,9 @@ class ClusterPool(nn.Module):
         self.fold_h = fold_h
         self.iter = 5
         self.softmax = nn.Softmax(dim=-2)
-        
+        pool_size = int(agent_num ** 0.5)
+        self.pool = nn.AdaptiveAvgPool2d(output_size=(pool_size, pool_size))
+
     def forward(self, x):
         identity = self.conv_skip(x)
         value = self.conv_v(x)
@@ -163,18 +165,23 @@ class ClusterPool(nn.Module):
             x = rearrange(x, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w,
                           f2=self.fold_h)  # [bs*blocks,c,ks[0],ks[1]]
             value = rearrange(value, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w, f2=self.fold_h)
-        
+
+        agent_tokens = self.pool(x) # [b, c, pool_size, pool_size]
+        agent_tokens = agent_tokens.flatten(2).transpose(1, 2)  # [B, agent_num, C]
+
         b, c, w, h = x.shape
         centers = F.adaptive_avg_pool2d(x, (w // self.stride, h // self.stride))
         value_centers = rearrange(F.adaptive_avg_pool2d(value, (w // self.stride, h // self.stride)), 'b c w h -> b (w h) c')
-        value2 = rearrange(value, 'b c w h -> b (w h) c')  # [B,N,D]
+
+        value_agent = self.pool(value)  # [b, c, pool_size, pool_size]
+        value2 = rearrange(value_agent, 'b c w h -> b (w h) c')  # [B,A,D]
+
         b, c, ww, hh = centers.shape
-        M, N = value_centers.shape[1], value2.shape[1]
+        M, A = value_centers.shape[1], value2.shape[1]
         #print(M,N,b,c,ww,hh)
         # processing before flash attention
         centers = centers.reshape(b, M, c)
-        value2 = value2.reshape(b, N, c)
-        x = x.reshape(b, N, c)
+
 
 
         '''
@@ -184,22 +191,22 @@ class ClusterPool(nn.Module):
         '''
 
         for _ in range(self.iter):    # iterative clustering and updating centers
-            similarity = self.softmax((centers @ x.transpose(-2, -1)))
+            similarity = self.softmax((centers @ agent_tokens.transpose(-2, -1)))
             centers = similarity @ value2
 
 
 
 
-        sim = pairwise_cos_sim( centers, x )  # [B,M,N]
+        sim = pairwise_cos_sim( centers, agent_tokens )  # [B,M,A]
         # we use mask to sololy assign each point to one center
         sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
-        mask = torch.zeros_like(sim)  # binary #[B,M,N]
+        mask = torch.zeros_like(sim)  # binary #[B,M,A]
         mask.scatter_(1, sim_max_idx, 1.)
         
         # aggregate step, out shape [B,M,D]
         value2 = rearrange(value2, 'b n c -> (b n) c')
         sim_max_idx = rearrange(sim_max_idx.squeeze(1), 'b n -> (b n)')
-        idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, N).flatten()
+        idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, A).flatten()
         sim_max_idx = sim_max_idx + idx_offset
 
 
@@ -269,7 +276,7 @@ def pairwise_cos_sim(x1: torch.Tensor, x2: torch.Tensor):
 
 
 class Cluster(nn.Module):
-    def __init__(self, dim, out_dim, proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24):
+    def __init__(self, dim, out_dim, proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24, agent_num=16):
         """
         :param dim:  channel nubmer
         :param out_dim: channel nubmer
@@ -293,6 +300,8 @@ class Cluster(nn.Module):
         self.fold_h = fold_h
         self.iters = 5
         self.softmax = nn.Softmax(dim=-2)
+        self.pool_size = int(agent_num ** 0.5)
+        self.pool = nn.AdaptiveAvgPool2d(output_size=(self.pool_size, self.pool_size))
 
     def forward(self, x):  # [b,c,w,h]
         value = self.v(x)
@@ -310,20 +319,26 @@ class Cluster(nn.Module):
             value = rearrange(value, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w, f2=self.fold_h)
         
         b, c, w, h = x.shape
+        agent_tokens = self.pool(x) # [b, c, pool_size, pool_size]
+       
+        agent_tokens = agent_tokens.flatten(2).transpose(1, 2)  # [B, agent_num, C]
+
         centers = self.centers_proposal(x)  # [b,c,C_W,C_H], we set M = C_W*C_H and N = w*h
         value_centers = rearrange(self.centers_proposal(value), 'b c w h -> b (w h) c')  # [b,C_W,C_H,c]
-        value2 = rearrange(value, 'b c w h -> b (w h) c')  # [B,N,D]
+
+        value_agent = self.pool(value)  # [b, c, pool_size, pool_size]
+        value2 = rearrange(value_agent, 'b c w h -> b (w h) c')  # [B,A,D]
         
 
-        M, N = value_centers.shape[1], value2.shape[1]
+        M, A = value_centers.shape[1], value2.shape[1]
         
         b, c, ww, hh = centers.shape
 
         centers = centers.reshape(b, M, c)
-        x = x.reshape(b, N, c)
+
 
         for _ in range(self.iters):    # iterative clustering and updating centers
-            similarity = self.softmax((centers @ x.transpose(-2, -1)))
+            similarity = self.softmax((centers @ agent_tokens.transpose(-2, -1)))
             centers = similarity @ value2
 
 
@@ -336,7 +351,7 @@ class Cluster(nn.Module):
         sim = torch.sigmoid(
             self.sim_beta +
             self.sim_alpha * pairwise_cos_sim(
-                centers, x
+                centers, agent_tokens
             )
         )  # [B,M,N]
         
@@ -347,7 +362,7 @@ class Cluster(nn.Module):
         sim = sim * mask
 
         sim_max_idx = rearrange(sim_max_idx.squeeze(1), 'b n -> (b n)')
-        idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, N).flatten()
+        idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, A).flatten()
         sim_max_idx = sim_max_idx + idx_offset
         out = rearrange(scatter_sum(value2, sim_max_idx, dim=0, dim_size=b*M), '(b m) c -> b m c', b=b, m=M)  # Different from CoC's implementation "(value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2)", we use scatter_sum to avoid OOM.
         out = (out + value_centers) / (mask.sum(dim=-1, keepdim=True) + 1.0)
@@ -358,13 +373,14 @@ class Cluster(nn.Module):
   
         # dispatch step, return to each point in a cluster
         out = (out.unsqueeze(dim=2) * sim.unsqueeze(dim=-1)).sum(dim=1)  # [B,N,D]
-        out = rearrange(out, "b (w h) c -> b c w h", w=w)
+        out = rearrange(out, "b (w h) c -> b c w h", w=self.pool_size)
         if self.fold_w > 1 and self.fold_h > 1:
             # recover the splited regions back to big feature maps if use the region partition.
             out = rearrange(out, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
         out = rearrange(out, "(b e) c w h -> b (e c) w h", e=self.heads)
 
         out = self.proj(out)
+        out = F.interpolate(out, size=(w, h), mode='area')
         return out
 
 
@@ -418,13 +434,13 @@ class ClusterBlock(nn.Module):
                  act_layer=nn.GELU, norm_layer=GroupNorm,
                  drop=0., drop_path=0.,
                  use_layer_scale=True, layer_scale_init_value=1e-5,
-                 proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24):
+                 proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24, agent_num=16):
 
         super().__init__()
 
         self.norm1 = norm_layer(dim)
         self.token_mixer = Cluster(dim=dim, out_dim=dim, proposal_w=proposal_w, proposal_h=proposal_h,
-                                   fold_w=fold_w, fold_h=fold_h, heads=heads, head_dim=head_dim)
+                                   fold_w=fold_w, fold_h=fold_h, heads=heads, head_dim=head_dim, agent_num=agent_num)
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim,
@@ -456,7 +472,7 @@ def basic_blocks(dim, index, layers,
                  act_layer=nn.GELU, norm_layer=GroupNorm,
                  drop_rate=.0, drop_path_rate=0.,
                  use_layer_scale=True, layer_scale_init_value=1e-5,
-                 proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24):
+                 proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24, agent_num=16):
     blocks = []
     for block_idx in range(layers[index]):
         block_dpr = drop_path_rate * ( block_idx + sum(layers[:index])) / (sum(layers) - 1)
@@ -467,7 +483,7 @@ def basic_blocks(dim, index, layers,
             use_layer_scale=use_layer_scale,
             layer_scale_init_value=layer_scale_init_value,
             proposal_w=proposal_w, proposal_h=proposal_h, fold_w=fold_w, fold_h=fold_h,
-            heads=heads, head_dim=head_dim
+            heads=heads, head_dim=head_dim, agent_num=agent_num
         ))
     blocks = nn.Sequential(*blocks)
 
@@ -503,7 +519,7 @@ class FEC(nn.Module):
                  init_cfg=None,
                  pretrained=None,
                  proposal_w=[2, 2, 2, 2], proposal_h=[2, 2, 2, 2], fold_w=[8, 4, 2, 1], fold_h=[8, 4, 2, 1],
-                 heads=[2, 4, 6, 8], head_dim=[16, 16, 32, 32],  **kwargs):
+                 heads=[2, 4, 6, 8], head_dim=[16, 16, 32, 32], agent_nums=[49, 49, 49, 49], **kwargs):
 
         super().__init__()
 
@@ -528,7 +544,7 @@ class FEC(nn.Module):
                                  layer_scale_init_value=layer_scale_init_value,
                                  proposal_w=proposal_w[i], proposal_h=proposal_h[i],
                                  fold_w=fold_w[i], fold_h=fold_h[i], heads=heads[i], head_dim=head_dim[i],
-                        
+                                    agent_num=agent_nums[i]  # number of agents in each cluster
                                  )
             network.append(stage)
             if i >= len(layers) - 1:
@@ -677,6 +693,7 @@ def fec_small(pretrained=False, **kwargs):
     fold_h = [1, 1, 1, 1]
     heads = [4, 4, 8, 8]
     head_dim = [24, 24, 24, 24]
+    agent_nums=[49, 49, 25, 25]
     down_patch_size = 3
     down_pad = 1
     model = FEC(
@@ -684,7 +701,7 @@ def fec_small(pretrained=False, **kwargs):
         mlp_ratios=mlp_ratios, downsamples=downsamples,
         down_patch_size=down_patch_size, down_pad=down_pad,
         proposal_w=proposal_w, proposal_h=proposal_h, fold_w=fold_w, fold_h=fold_h,
-        heads=heads, head_dim=head_dim,  **kwargs)
+        heads=heads, head_dim=head_dim, agent_nums=agent_nums, **kwargs)
     model.default_cfg = default_cfgs['model_small']
     return model
 
