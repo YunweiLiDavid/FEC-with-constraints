@@ -93,7 +93,7 @@ class ClusterPool(nn.Module):
         #add agent number
         pool_size = int(agent_num ** 0.5)  
         self.pool = nn.AdaptiveAvgPool2d(output_size=(pool_size, pool_size))
-        self.iters = 6
+        self.iters = 3
         #self.q = nn.Linear(embed_dim, embed_dim, bias=False)
 
     def forward(self, x):
@@ -210,7 +210,7 @@ class Cluster(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d(output_size=(self.pool_size, self.pool_size))
         self.dim = dim
         self.out_dim = out_dim
-        self.iters = 6
+        self.iters = 3
         #self.q = nn.Linear(head_dim, head_dim, bias=False)
 
     def forward(self, x):  # [b,c,w,h]
@@ -279,9 +279,27 @@ class Cluster(nn.Module):
             # recover the splited regions back to big feature maps if use the region partition.
             out = rearrange(out, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
         out = rearrange(out, "(b e) c w h -> b (e c) w h", e=self.heads)
-
-        out = self.proj(out)
         out = F.interpolate(out, size=(w, h), mode='area')
+        out = self.proj(out)
+        
+        '''
+         # dynamic upsampling
+        scale_h = h // self.pool_size
+        scale_w = w // self.pool_size
+
+        self.upsample = nn.ConvTranspose2d(
+            in_channels=self.out_dim,
+            out_channels=self.out_dim,
+            kernel_size=(scale_h, scale_w),
+            stride=(scale_h, scale_w),
+            padding=0,
+            bias=False
+        ).to(x.device)
+        out = self.upsample(out)
+
+        if out.shape[-2:] != (w, h):
+            out = F.interpolate(out, size=(w, h), mode='area')
+        '''
         return out
 
 
