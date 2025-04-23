@@ -73,6 +73,109 @@ class PointReducer(nn.Module):
         x = self.proj(x)
         x = self.norm(x)
         return x
+
+'''
+class ClusterPool(nn.Module):
+    """
+    Input: tensor in shape [B, in_chans, H, W]
+    Output: tensor in shape [B, embed_dim, H/stride, W/stride]
+    """
+
+    def __init__(self, stride=4, in_chans=5, embed_dim=64, norm_layer=None, fold_w=1, fold_h=1, agent_num=16):
+        super().__init__()
+        self.norm2 = GroupNorm(embed_dim)
+        self.stride = stride
+        self.conv_f = nn.Conv2d(in_chans, embed_dim, kernel_size=1)  # for similarity
+        self.conv_v = nn.Conv2d(in_chans, embed_dim, kernel_size=1)  # for value
+        self.conv_skip = nn.Conv2d(in_chans, embed_dim, kernel_size=3, padding=1, stride=2)  # for skip connection
+        self.fold_w = fold_w
+        self.fold_h = fold_h
+        self.iter = 5
+        self.softmax = nn.Softmax(dim=-2)
+        pool_size = int(agent_num ** 0.5)
+        self.pool = nn.AdaptiveAvgPool2d(output_size=(pool_size, pool_size))
+        self.gru = nn.GRUCell(embed_dim, embed_dim)
+
+    def forward(self, x):
+        identity = self.conv_skip(x)
+        value = self.conv_v(x)
+        x = self.conv_f(x)
+        if self.fold_w > 1 and self.fold_h > 1:
+            # split the big feature maps to small local regions to reduce computations.
+            # only for tasks with very high resolution, e.g., detection
+            b0, c0, w0, h0 = x.shape
+            assert w0 % self.fold_w == 0 and h0 % self.fold_h == 0, \
+                f"Ensure the feature map size ({w0}*{h0}) can be divided by fold {self.fold_w}*{self.fold_h}"
+            x = rearrange(x, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w,
+                          f2=self.fold_h)  # [bs*blocks,c,ks[0],ks[1]]
+            value = rearrange(value, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w, f2=self.fold_h)
+
+        agent_tokens = self.pool(x) # [b, c, pool_size, pool_size]
+        agent_tokens = agent_tokens.flatten(2).transpose(1, 2)  # [B, agent_num, C]
+
+        b, c, w, h = x.shape
+        centers = F.adaptive_avg_pool2d(x, (w // self.stride, h // self.stride))
+        value_centers = rearrange(F.adaptive_avg_pool2d(value, (w // self.stride, h // self.stride)), 'b c w h -> b (w h) c')
+
+        value_agent = self.pool(value)  # [b, c, pool_size, pool_size]
+        value2 = rearrange(value_agent, 'b c w h -> b (w h) c')  # [B,A,D]
+
+        b, c, ww, hh = centers.shape
+        M, A = value_centers.shape[1], value2.shape[1]
+        #print(M,N,b,c,ww,hh)
+        # processing before flash attention
+        centers = centers.reshape(b, M, c)
+
+
+
+        for _ in range(self.iter):    # iterative clustering and updating centers
+            similarity = self.softmax((centers @ agent_tokens.transpose(-2, -1)))
+            updates = similarity @ value2
+            centers = self.gru(
+                updates.reshape(b*M,c),
+                centers.reshape(b*M,c)
+            )
+            centers = centers.reshape(b, M, c)
+
+
+
+
+        sim = pairwise_cos_sim( centers, agent_tokens )  # [B,M,A]
+        # we use mask to sololy assign each point to one center
+        sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
+        mask = torch.zeros_like(sim)  # binary #[B,M,A]
+        mask.scatter_(1, sim_max_idx, 1.)
+        
+        # aggregate step, out shape [B,M,D]
+        value2 = rearrange(value2, 'b n c -> (b n) c')
+        sim_max_idx = rearrange(sim_max_idx.squeeze(1), 'b n -> (b n)')
+        idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, A).flatten()
+        sim_max_idx = sim_max_idx + idx_offset
+
+
+
+
+        out = rearrange(scatter_sum(value2, sim_max_idx, dim=0, dim_size=b*M), '(b m) c -> b m c', b=b, m=M)  # Different from CoC's implementation "(value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2)", we use scatter_sum to avoid OOM.
+        
+
+        
+        
+        out = (out + value_centers) / (mask.sum(dim=-1, keepdim=True) + 1.0)
+
+        out = rearrange(out, 'b (w h) c -> b c w h', w=ww, h=hh)
+        if self.fold_w > 1 and self.fold_h > 1:
+            # recover the splited regions back to big feature maps if use the region partition.
+            out = rearrange(out, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
+
+
+
+
+
+        out = identity + self.norm2(out)
+        out = out
+
+        return out
+'''
 '''
 class ClusterPool(nn.Module):
     """
@@ -138,7 +241,7 @@ class ClusterPool(nn.Module):
     Output: tensor in shape [B, embed_dim, H/stride, W/stride]
     """
 
-    def __init__(self, stride=4, in_chans=5, embed_dim=64, norm_layer=None, fold_w=1, fold_h=1, agent_num=16):
+    def __init__(self, stride=4, in_chans=5, embed_dim=64, norm_layer=None, fold_w=1, fold_h=1, agent_num=49):
         super().__init__()
         self.norm2 = GroupNorm(embed_dim)
         self.stride = stride
@@ -147,10 +250,11 @@ class ClusterPool(nn.Module):
         self.conv_skip = nn.Conv2d(in_chans, embed_dim, kernel_size=3, padding=1, stride=2)  # for skip connection
         self.fold_w = fold_w
         self.fold_h = fold_h
-        self.iter = 5
-        self.softmax = nn.Softmax(dim=-2)
-        pool_size = int(agent_num ** 0.5)
+        #add agent number
+        pool_size = int(agent_num ** 0.5)  
         self.pool = nn.AdaptiveAvgPool2d(output_size=(pool_size, pool_size))
+        self.iters = 3
+        #self.q = nn.Linear(embed_dim, embed_dim, bias=False)
 
     def forward(self, x):
         identity = self.conv_skip(x)
@@ -165,73 +269,55 @@ class ClusterPool(nn.Module):
             x = rearrange(x, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w,
                           f2=self.fold_h)  # [bs*blocks,c,ks[0],ks[1]]
             value = rearrange(value, "b c (f1 w) (f2 h) -> (b f1 f2) c w h", f1=self.fold_w, f2=self.fold_h)
-
-        agent_tokens = self.pool(x) # [b, c, pool_size, pool_size]
-        agent_tokens = agent_tokens.flatten(2).transpose(1, 2)  # [B, agent_num, C]
-
+        
+        
         b, c, w, h = x.shape
+
+        #print("X",x.shape)
+        agent_tokens = self.pool(x) # [b, c, pool_size, pool_size]
+        #print("A",agent_tokens.shape)
+
+        agent_tokens = agent_tokens.flatten(2).transpose(1, 2)  # [B, agent_num, C]
+        #print("A",agent_tokens.shape)
+
         centers = F.adaptive_avg_pool2d(x, (w // self.stride, h // self.stride))
+        #print("centers",centers.shape)
         value_centers = rearrange(F.adaptive_avg_pool2d(value, (w // self.stride, h // self.stride)), 'b c w h -> b (w h) c')
+        b, c, ww, hh = centers.shape
 
         value_agent = self.pool(value)  # [b, c, pool_size, pool_size]
         value2 = rearrange(value_agent, 'b c w h -> b (w h) c')  # [B,A,D]
-
-        b, c, ww, hh = centers.shape
         M, A = value_centers.shape[1], value2.shape[1]
-        #print(M,N,b,c,ww,hh)
-        # processing before flash attention
-        centers = centers.reshape(b, M, c)
-
-
-
-        '''
-        print(f"centers shape: {centers.shape}")  # 形状：[batch, num_heads, seq_len, head_dim]
-        print(f"value2 shape: {value2.shape}")
-        print(f"x shape: {x.shape}")
-        '''
-
-        for _ in range(self.iter):    # iterative clustering and updating centers
-            similarity = self.softmax((centers @ agent_tokens.transpose(-2, -1)))
-            centers = similarity @ value2
-
-
-
-
-        sim = pairwise_cos_sim( centers, agent_tokens )  # [B,M,A]
-        # we use mask to sololy assign each point to one center
-        sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
-        mask = torch.zeros_like(sim)  # binary #[B,M,A]
-        mask.scatter_(1, sim_max_idx, 1.)
-        
-        # aggregate step, out shape [B,M,D]
         value2 = rearrange(value2, 'b n c -> (b n) c')
-        sim_max_idx = rearrange(sim_max_idx.squeeze(1), 'b n -> (b n)')
-        idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, A).flatten()
-        sim_max_idx = sim_max_idx + idx_offset
 
 
+        for _ in range(self.iters):
+            sim = pairwise_cos_sim( centers.reshape(b, c, -1).permute(0, 2, 1), agent_tokens )  # [B,M,A]
+            # we use mask to sololy assign each point to one center
+            sim_max, sim_max_idx = sim.max(dim=1, keepdim=True)
+            mask = torch.zeros_like(sim)  # binary #[B,M,A]
+            mask.scatter_(1, sim_max_idx, 1.)
+            
+            # aggregate step, out shape [B,M,D]
 
-
-        out = rearrange(scatter_sum(value2, sim_max_idx, dim=0, dim_size=b*M), '(b m) c -> b m c', b=b, m=M)  # Different from CoC's implementation "(value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2)", we use scatter_sum to avoid OOM.
-        
-
-        
-        
-        out = (out + value_centers) / (mask.sum(dim=-1, keepdim=True) + 1.0)
+            sim_max_idx = rearrange(sim_max_idx.squeeze(1), 'b n -> (b n)')
+            idx_offset = (torch.arange(b, device=sim_max_idx.device) * M).unsqueeze(-1).expand(-1, A).flatten()
+            sim_max_idx = sim_max_idx + idx_offset
+            out = rearrange(scatter_sum(value2, sim_max_idx, dim=0, dim_size=b*M), '(b m) c -> b m c', b=b, m=M)  # Different from CoC's implementation "(value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2)", we use scatter_sum to avoid OOM.
+            out = (out + value_centers) / (mask.sum(dim=-1, keepdim=True) + 1.0)
+            #print("out pool",out.shape)#B M D
+            #centers = self.q(out)
+            centers = rearrange(out, 'b (w h) c -> b c w h', w=ww, h=hh)
 
         out = rearrange(out, 'b (w h) c -> b c w h', w=ww, h=hh)
+
         if self.fold_w > 1 and self.fold_h > 1:
             # recover the splited regions back to big feature maps if use the region partition.
             out = rearrange(out, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
 
-
-
-
-
         out = identity + self.norm2(out)
-        out = out
-
         return out
+
 
 def scaled_dot_product_attention(Q, K, V):
     """
@@ -302,6 +388,9 @@ class Cluster(nn.Module):
         self.softmax = nn.Softmax(dim=-2)
         self.pool_size = int(agent_num ** 0.5)
         self.pool = nn.AdaptiveAvgPool2d(output_size=(self.pool_size, self.pool_size))
+        self.q = nn.Linear(head_dim, head_dim, bias=False)
+        self.gru = nn.GRUCell(self.head_dim, self.head_dim)
+
 
     def forward(self, x):  # [b,c,w,h]
         value = self.v(x)
@@ -339,8 +428,12 @@ class Cluster(nn.Module):
 
         for _ in range(self.iters):    # iterative clustering and updating centers
             similarity = self.softmax((centers @ agent_tokens.transpose(-2, -1)))
-            centers = similarity @ value2
-
+            updates = similarity @ value2
+            centers = self.gru(
+                updates.reshape(b*M,c),
+                centers.reshape(b*M,c)
+            )
+            centers = centers.reshape(b, M, c)
 
 
         # aggregate step
