@@ -183,7 +183,7 @@ def pairwise_cos_sim(x1: torch.Tensor, x2: torch.Tensor):
 
 
 class Cluster(nn.Module):
-    def __init__(self, dim, out_dim, proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24, agent_num=49):
+    def __init__(self, dim, out_dim, proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24, agent_num=49, shared_q=None):
         """
         :param dim:  channel nubmer
         :param out_dim: channel nubmer
@@ -211,7 +211,8 @@ class Cluster(nn.Module):
         self.dim = dim
         self.out_dim = out_dim
         self.iters = 3
-        #self.q = nn.Linear(head_dim, head_dim, bias=False)
+        self.q = shared_q if shared_q is not None else nn.Identity()
+        #self.gru = nn.GRUCell(self.head_dim, self.head_dim)
 
     def forward(self, x):  # [b,c,w,h]
         value = self.v(x)
@@ -266,7 +267,14 @@ class Cluster(nn.Module):
             sim_max_idx = sim_max_idx + idx_offset
             out = rearrange(scatter_sum(value2, sim_max_idx, dim=0, dim_size=b*M), '(b m) c -> b m c', b=b, m=M)  # Different from CoC's implementation "(value2.unsqueeze(dim=1) * sim.unsqueeze(dim=-1)).sum(dim=2)", we use scatter_sum to avoid OOM.
             out = (out + value_centers) / (mask.sum(dim=-1, keepdim=True) + 1.0)
-            #centers = self.q(out)
+            centers = self.q(out)
+            '''
+            centers = self.gru(
+                out.reshape(b*M,c),
+                centers.reshape(b*M,c)
+            )
+            '''
+            centers = centers.reshape(b, M, c)
             centers = rearrange(out, 'b (w h) c -> b c w h', w=ww, h=hh)
 
 
@@ -279,9 +287,9 @@ class Cluster(nn.Module):
             # recover the splited regions back to big feature maps if use the region partition.
             out = rearrange(out, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
         out = rearrange(out, "(b e) c w h -> b (e c) w h", e=self.heads)
-        out = F.interpolate(out, size=(w, h), mode='area')
-        out = self.proj(out)
         
+        out = self.proj(out)
+        out = F.interpolate(out, size=(w, h), mode='area')
         '''
          # dynamic upsampling
         scale_h = h // self.pool_size
@@ -353,13 +361,13 @@ class ClusterBlock(nn.Module):
                  act_layer=nn.GELU, norm_layer=GroupNorm,
                  drop=0., drop_path=0.,
                  use_layer_scale=True, layer_scale_init_value=1e-5,
-                 proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24, agent_num=49):
+                 proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24, agent_num=49, shared_q=None):
 
         super().__init__()
 
         self.norm1 = norm_layer(dim)
         self.token_mixer = Cluster(dim=dim, out_dim=dim, proposal_w=proposal_w, proposal_h=proposal_h,
-                                   fold_w=fold_w, fold_h=fold_h, heads=heads, head_dim=head_dim, agent_num=agent_num)
+                                   fold_w=fold_w, fold_h=fold_h, heads=heads, head_dim=head_dim, agent_num=agent_num, shared_q=shared_q)
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim,
@@ -391,7 +399,9 @@ def basic_blocks(dim, index, layers,
                  act_layer=nn.GELU, norm_layer=GroupNorm,
                  drop_rate=.0, drop_path_rate=0.,
                  use_layer_scale=True, layer_scale_init_value=1e-5,
-                 proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24, agent_num=49):
+                 proposal_w=2, proposal_h=2, fold_w=2, fold_h=2, heads=4, head_dim=24, agent_num=49, 
+                 shared_q=None
+                 ):
     blocks = []
     for block_idx in range(layers[index]):
         block_dpr = drop_path_rate * ( block_idx + sum(layers[:index])) / (sum(layers) - 1)
@@ -402,7 +412,7 @@ def basic_blocks(dim, index, layers,
             use_layer_scale=use_layer_scale,
             layer_scale_init_value=layer_scale_init_value,
             proposal_w=proposal_w, proposal_h=proposal_h, fold_w=fold_w, fold_h=fold_h,
-            heads=heads, head_dim=head_dim, agent_num=agent_num
+            heads=heads, head_dim=head_dim, agent_num=agent_num, shared_q=shared_q
         ))
     blocks = nn.Sequential(*blocks)
 
@@ -453,6 +463,12 @@ class FEC(nn.Module):
         # set the main block in network
         network = []
         print(len(layers))
+        # add querys
+        self.q_list = nn.ModuleList([
+        nn.Linear(head_dim[i], head_dim[i], bias=False)
+        for i in range(len(layers))
+        ])
+
         for i in range(len(layers)):
             stage = basic_blocks(embed_dims[i], i, layers,
                                  mlp_ratio=mlp_ratios[i],
@@ -463,7 +479,7 @@ class FEC(nn.Module):
                                  layer_scale_init_value=layer_scale_init_value,
                                  proposal_w=proposal_w[i], proposal_h=proposal_h[i],
                                  fold_w=fold_w[i], fold_h=fold_h[i], heads=heads[i], head_dim=head_dim[i],
-                                 agent_num=agent_num[i]
+                                 agent_num=agent_num[i], shared_q=self.q_list[i]
                                  )
             network.append(stage)
             if i >= len(layers) - 1:
